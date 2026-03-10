@@ -61,26 +61,40 @@ from ui.config_dialog   import ConfigDialog
 
 class _TabCompleter:
     WINDOW   = 500
-    _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z\-]{5,}")
+    # 4+ letter words (allow hyphens inside)
+    _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z\-]{3,}")
 
     def __init__(self):
-        self._words: dict[str, int] = collections.OrderedDict()
+        # key = lowercase, value = (original_word, line_number)
+        # We keep the original casing for display but match on lowercase.
+        self._words: dict[str, tuple[str, int]] = collections.OrderedDict()
         self._line  = 0
 
     def feed(self, text: str):
         self._line += text.count("\n")
         for w in self._WORD_RE.findall(text):
             lw = w.lower()
+            # Always refresh recency; prefer the most-recently-seen casing
             self._words.pop(lw, None)
-            self._words[lw] = self._line
+            self._words[lw] = (w, self._line)
         cutoff = self._line - self.WINDOW
-        stale = [w for w, ln in self._words.items() if ln < cutoff]
-        for w in stale:
-            del self._words[w]
+        stale = [k for k, (_, ln) in self._words.items() if ln < cutoff]
+        for k in stale:
+            del self._words[k]
 
     def complete(self, prefix: str) -> list[str]:
+        """
+        Return completions (most-recent first) whose lowercase form starts
+        with the lowercase prefix.  If the prefix is all-lowercase the
+        original-cased word is returned so the user can tab-cycle through
+        capitalised variants; if the prefix has capitals we preserve them.
+        """
         p = prefix.lower()
-        return [w for w in reversed(list(self._words)) if w.startswith(p)]
+        results = []
+        for lw, (orig, _) in reversed(list(self._words.items())):
+            if lw.startswith(p):
+                results.append(orig)
+        return results
 
 
 # ── Command input ─────────────────────────────────────────────────────
@@ -90,13 +104,15 @@ class _InputLine(QLineEdit):
 
     def __init__(self, completer: _TabCompleter, parent=None):
         super().__init__(parent)
-        self._history:     list[str] = []
-        self._hist_idx:    int       = -1
-        self._hist_prefix: str       = ""
-        self._completer  = completer
-        self._tab_matches: list[str] = []
-        self._tab_idx:     int       = -1
-        self._tab_anchor:  int       = 0
+        self._history:      list[str]  = []
+        self._hist_idx:     int        = -1
+        self._hist_prefix:  str        = ""
+        self._hist_matches: list[int]  = []   # indices into _history
+        self._hist_pos:     int        = -1   # position within _hist_matches
+        self._completer   = completer
+        self._tab_matches: list[str]  = []
+        self._tab_idx:     int        = -1
+        self._tab_anchor:  int        = 0
 
         self.setStyleSheet("""
             QLineEdit {
@@ -115,52 +131,79 @@ class _InputLine(QLineEdit):
     def add_history(self, text: str):
         if text and (not self._history or self._history[-1] != text):
             self._history.append(text)
-        self._hist_idx  = -1
+        self._hist_idx    = -1
         self._hist_prefix = ""
         self._clear_tab()
+        # Leave text in field but select all so the user can type over it
+        # or just press Enter again to resend.
+        self.selectAll()
+
+    def event(self, event):
+        # Tab must be caught here, before Qt routes it to the focus chain.
+        if event.type() == event.Type.KeyPress and event.key() == Qt.Key.Key_Tab:
+            self._tab_complete()
+            return True   # consumed
+        return super().event(event)
 
     def keyPressEvent(self, event: QKeyEvent):
-        key  = event.key()
-        mods = event.modifiers()
+        key = event.key()
 
         if key == Qt.Key.Key_Up:
             self._history_step(-1); return
         if key == Qt.Key.Key_Down:
             self._history_step(+1); return
 
-        if key == Qt.Key.Key_Tab:
-            self._tab_complete(); return
-
-        # any other key resets tab state
-        self._clear_tab()
+        # any typing resets history position and tab state
         self._hist_idx = -1
+        self._hist_prefix = ""
+        self._clear_tab()
         super().keyPressEvent(event)
 
     # history
+    #
+    # _hist_prefix  — the text that was in the box when Up was first pressed;
+    #                 all searches are filtered to entries starting with this.
+    # _hist_idx     — index into self._history of the currently shown entry,
+    #                 or -1 when showing the live (user-typed) text.
+    # _hist_matches — indices of history entries that match _hist_prefix,
+    #                 in chronological order (oldest first).
+    # _hist_pos     — position within _hist_matches (-1 = live text end).
 
     def _history_step(self, direction: int):
+        # direction: -1 = Up (go back in time), +1 = Down (go forward)
         if not self._history:
             return
+
+        # First keypress: snapshot prefix and build the filtered match list
         if self._hist_idx == -1:
-            self._hist_prefix = self.text()
+            self._hist_prefix = self.selectedText() if self.hasSelectedText()                                 else self.text()
+            # Strip trailing selection so prefix is just what the user typed
+            # (when the field shows a previously selected command, we want
+            # the *current visible text* as the filter, not an empty string)
+            self._hist_matches = [
+                i for i, cmd in enumerate(self._history)
+                if cmd.startswith(self._hist_prefix)
+            ]
+            self._hist_pos = len(self._hist_matches)  # one past end = live
 
-        # search from current position
-        start = self._hist_idx + direction
-        if direction < 0:
-            rng = range(min(start, len(self._history)-1), -1, -1)
-        else:
-            rng = range(max(start, 0), len(self._history))
+        if not self._hist_matches:
+            return
 
-        for i in rng:
-            if self._history[i].startswith(self._hist_prefix):
-                self._hist_idx = i
-                self.setText(self._history[i])
-                self.end(False)
-                return
-
-        if direction > 0:
+        new_pos = self._hist_pos + direction
+        if new_pos < 0:
+            new_pos = 0          # clamp at oldest match
+        elif new_pos >= len(self._hist_matches):
+            # Scrolled past newest → restore live text
             self._hist_idx = -1
+            self._hist_pos = len(self._hist_matches)
             self.setText(self._hist_prefix)
+            self.selectAll()
+            return
+
+        self._hist_pos = new_pos
+        self._hist_idx = self._hist_matches[new_pos]
+        self.setText(self._history[self._hist_idx])
+        self.selectAll()
 
     # tab completion
 
@@ -215,6 +258,7 @@ class MainWindow(QMainWindow):
         self._last_host: str = ""
         self._last_port: int = 4000
         self._session:   Session | None = None
+        self._cmd_sep:   str = ";"   # configurable command separator
 
         self._completer = _TabCompleter()
         self._map       = MapGraph()
@@ -394,6 +438,7 @@ class MainWindow(QMainWindow):
 
         # load scripting config
         self._engine.clear()
+        self._cmd_sep = config.get("cmd_separator", ";") or ";"
         if config:
             self._engine.load_config(config)
 
@@ -527,9 +572,12 @@ class MainWindow(QMainWindow):
 
     def _on_return(self):
         cmd = self._input.text().strip()
-        self._input.clear()
+        # Don't clear — add_history() keeps the text and selects it so
+        # the user can retype or just press Enter again to resend.
         if cmd:
             self._input.add_history(cmd)
+        else:
+            self._input.selectAll()
         self._send_command(cmd)
 
     def _send_command(self, cmd: str):
@@ -537,9 +585,13 @@ class MainWindow(QMainWindow):
         if not self._connected:
             self._output.append_local("Not connected — use File → Sessions or Quick Connect", "#c4a000")
             return
-        # try alias expansion first
-        if not self._engine.process_alias(cmd):
-            self._send_raw_command(cmd)
+        # Split on the configured separator so "go north;kill orc" sends two commands
+        parts = [p.strip() for p in cmd.split(self._cmd_sep) if p.strip()]
+        if not parts:
+            return
+        for part in parts:
+            if not self._engine.process_alias(part):
+                self._send_raw_command(part)
 
     def _send_raw_command(self, cmd: str):
         """Send text directly to the server (no alias expansion)."""
@@ -572,6 +624,7 @@ class MainWindow(QMainWindow):
                         sessions[i] = self._session
                         break
                 _save_sessions(sessions)
+            self._cmd_sep = new_cfg.get("cmd_separator", ";") or ";"
             self._engine.load_config(new_cfg)
             self._button_bar.load_buttons(new_cfg.get("buttons", []))
 

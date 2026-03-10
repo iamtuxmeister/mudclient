@@ -47,12 +47,13 @@ _DARK = """
 """
 
 _DEFAULT_CONFIG = {
-    "aliases":    [],
-    "actions":    [],
-    "timers":     [],
-    "highlights": [],
-    "variables":  [],
-    "buttons":    [],
+    "aliases":       [],
+    "actions":       [],
+    "timers":        [],
+    "highlights":    [],
+    "variables":     [],
+    "buttons":       [],
+    "cmd_separator": ";",
 }
 
 
@@ -114,6 +115,20 @@ class ConfigDialog(QDialog):
         vbox = QVBoxLayout(self)
         tabs = QTabWidget()
         vbox.addWidget(tabs)
+
+        # ── General ──────────────────────────────────────────────────
+        gen_widget = QWidget()
+        gen_layout = QFormLayout(gen_widget)
+        gen_layout.setContentsMargins(12, 12, 12, 12)
+        gen_layout.setSpacing(10)
+        self._sep_edit = QLineEdit(self._cfg.get("cmd_separator", ";"))
+        self._sep_edit.setMaximumWidth(60)
+        self._sep_edit.setToolTip(
+            "Character(s) used to split stacked commands in the input line.\n"
+            "e.g. with ';' you can type  north;kill orc;loot  to send 3 commands."
+        )
+        gen_layout.addRow("Command separator:", self._sep_edit)
+        tabs.addTab(gen_widget, "General")
 
         # ── Aliases ──────────────────────────────────────────────────
         self._alias_table = _make_table(["Name", "Body", "On"])
@@ -188,6 +203,8 @@ class ConfigDialog(QDialog):
         return w
 
     def _save_and_accept(self):
+        sep = self._sep_edit.text()
+        self._cfg["cmd_separator"] = sep if sep else ";"
         self._cfg["aliases"]    = _table_to_list(self._alias_table,  ["name", "body", "enabled"])
         self._cfg["actions"]    = _table_to_list(self._action_table,  ["pattern", "command", "gui_target", "enabled"])
         self._cfg["timers"]     = _table_to_list(self._timer_table,   ["name", "interval", "command", "enabled"])

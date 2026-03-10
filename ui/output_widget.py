@@ -38,6 +38,8 @@ class OutputWidget(QTextEdit):
         self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.setUndoRedoEnabled(False)
         self.document().setMaximumBlockCount(_SCROLLBACK_LIMIT)
+        # Never steal keyboard focus — input line must always keep it.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._font_size  = 11
         self._base_font  = self._make_font()
