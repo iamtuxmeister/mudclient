@@ -91,6 +91,7 @@ class SessionManager(QDialog):
         layout.addWidget(self._list)
 
         btn_row = QHBoxLayout()
+        self._connect_btn = None
         for label, slot in [
             ("Connect",   self._on_connect),
             ("New",       self._on_new),
@@ -98,6 +99,10 @@ class SessionManager(QDialog):
         ]:
             b = QPushButton(label)
             b.clicked.connect(slot)
+            if label == "Connect":
+                b.setDefault(True)   # pressing Enter triggers this button
+                b.setAutoDefault(True)
+                self._connect_btn = b
             btn_row.addWidget(b)
         layout.addLayout(btn_row)
 
@@ -106,6 +111,9 @@ class SessionManager(QDialog):
         layout.addWidget(box)
 
         self._refresh_list()
+        # Focus the list so arrow keys work immediately; Enter goes to
+        # the default Connect button via the dialog's key handling.
+        self._list.setFocus()
 
     # ── Helpers ─────────────────────────────────────────────────────
 

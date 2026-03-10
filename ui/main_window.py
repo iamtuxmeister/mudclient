@@ -229,6 +229,10 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._set_status("Disconnected")
 
+        # Show session picker as soon as the event loop starts
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._show_sessions)
+
     # ── Palette ──────────────────────────────────────────────────────
 
     def _build_palette(self):
@@ -414,7 +418,13 @@ class MainWindow(QMainWindow):
         worker.gmcp_received.connect(self._on_gmcp)
         worker.mccp_active.connect(self._on_mccp_active)
 
-        self._send_signal.connect(worker.send)
+        # DirectConnection: executes worker.send() on the calling
+        # (GUI) thread rather than queuing on the worker thread.
+        # Necessary because the worker is blocked in recv() and
+        # its event queue is never drained while connected.
+        self._send_signal.connect(
+            worker.send, Qt.ConnectionType.DirectConnection
+        )
         # Connect to worker.start (a real bound slot), NOT a lambda.
         # A lambda bypasses Qt's thread-dispatch and runs on the GUI thread,
         # blocking the event loop with the recv() loop.
@@ -425,6 +435,10 @@ class MainWindow(QMainWindow):
 
         self._thread = thread
         self._worker = worker
+
+        # Give the input focus now so typing works immediately,
+        # even before _on_connected fires from the worker thread.
+        self._input.setFocus()
 
     def _reconnect(self):
         if self._last_host:

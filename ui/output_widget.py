@@ -105,9 +105,11 @@ class OutputWidget(QTextEdit):
 
     def append_bytes(self, data: bytes):
         """Decode bytes and render ANSI sequences."""
+        # Strip \r at byte level. MUD servers send \r\n but often interleave
+        # ANSI codes between \r and \n, so string-level replace misses them
+        # and the lone \r becomes a second \n causing double line feeds.
+        data = data.replace(b"\r", b"")
         text = data.decode("utf-8", errors="replace")
-        # normalise line endings
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
         self._render(text)
 
     def append_local(self, text: str, color: str = "#5599ff"):
