@@ -140,8 +140,11 @@ class OutputWidget(QTextEdit):
         cursor.insertText('\n')
         self.setTextCursor(cursor)
 
-    def append_local(self, text: str, color: str = '#5599ff'):
-        """Inject a local client message in a distinct italic colour."""
+    def append_local(self, text: str, color: str = '#5599ff', brackets: bool = True):
+        """Inject a local client message in a distinct italic colour.
+        brackets=True  -> [text]  (status messages, triggered commands)
+        brackets=False -> text    (user-typed command echo)
+        """
         cursor = self._end_cursor()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
@@ -149,7 +152,8 @@ class OutputWidget(QTextEdit):
         f.setItalic(True)
         fmt.setFont(f)
         cursor.setCharFormat(fmt)
-        cursor.insertText(f'[{text}]\n')
+        line = '[' + text + ']' if brackets else text
+        cursor.insertText(line + '\n')
         self.setTextCursor(cursor)
 
     def clear_output(self):

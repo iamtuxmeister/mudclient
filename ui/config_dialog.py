@@ -1,5 +1,5 @@
 """
-ConfigDialog — edit session configuration (aliases, actions, timers, buttons).
+ConfigDialog — edit session configuration (aliases, triggers, timers, buttons).
 
 Returns a config dict matching what ScriptEngine.load_config() expects.
 """
@@ -17,7 +17,11 @@ from PyQt6.QtWidgets import (
     QComboBox, QGridLayout, QFrame,
 )
 from PyQt6.QtGui import QColor
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
+
+from ui.window_settings import save_geometry
+
+from ui.trigger_editor import TriggerEditor
 
 
 _DARK = """
@@ -50,12 +54,15 @@ _DARK = """
 
 _DEFAULT_CONFIG = {
     "aliases":       [],
-    "actions":       [],
+    "trigger_folders": [],
     "timers":        [],
     "highlights":    [],
     "variables":     [],
     "buttons":       [],
     "cmd_separator": ";",
+    "cmd_echo":       True,
+    "cmd_echo_color": "#e8d44d",   # light yellow
+    "variables":      [],
     "palette": None,        # None = use theme name instead
     "palette_theme": "xterm",
 }
@@ -102,15 +109,38 @@ def _list_to_table(table: QTableWidget, rows: list[dict], keys: list[str]):
             table.setItem(r, col, item)
 
 
+def _migrate_actions(actions: list[dict]) -> list[dict]:
+    """Convert old flat actions list to the new folder-based structure."""
+    if not actions:
+        return []
+    triggers = []
+    for a in actions:
+        pattern = a.get("pattern", "") or a.get("body", "")
+        body    = a.get("body", "") or a.get("command", "")
+        # support old key names
+        if not body:
+            body = a.get("command", "")
+        triggers.append({
+            "name":     pattern[:40] if pattern else "Trigger",
+            "patterns": [pattern] if pattern else [],
+            "body":     body,
+            "enabled":  a.get("enabled", True),
+        })
+    return [{"name": "Imported", "enabled": True, "triggers": triggers}]
+
+
 class ConfigDialog(QDialog):
     """
-    Edit aliases, actions, timers, highlight patterns, and button bar.
+    Edit aliases, triggers, timers, highlight patterns, and button bar.
+    Non-modal, always-on-top — stays open while you play.
     """
+    config_saved = pyqtSignal(dict)   # emitted when OK is pressed
+
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuration")
-        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setMinimumSize(720, 520)
         self.setStyleSheet(_DARK)
 
@@ -132,21 +162,30 @@ class ConfigDialog(QDialog):
             "e.g. with ';' you can type  north;kill orc;loot  to send 3 commands."
         )
         gen_layout.addRow("Command separator:", self._sep_edit)
+
+        # Command echo — checkbox only; color lives on the Colors tab
+        self._echo_check = QCheckBox("Echo sent commands to output window")
+        self._echo_check.setChecked(self._cfg.get("cmd_echo", True))
+        gen_layout.addRow("Command echo:", self._echo_check)
         tabs.addTab(gen_widget, "General")
 
         # ── Colors ───────────────────────────────────────────────────
         tabs.addTab(self._build_colors_tab(), "Colors")
+
+        # ── Variables ────────────────────────────────────────────────
+        self._var_table = _make_table(["Variable", "Value"])
+        _list_to_table(self._var_table, self._cfg.get("variables", []), ["name", "value"])
+        tabs.addTab(self._wrap_table(self._var_table, ["name", "value"]), "Variables")
 
         # ── Aliases ──────────────────────────────────────────────────
         self._alias_table = _make_table(["Name", "Body", "On"])
         _list_to_table(self._alias_table, self._cfg["aliases"], ["name", "body", "enabled"])
         tabs.addTab(self._wrap_table(self._alias_table, ["name", "body"]), "Aliases")
 
-        # ── Actions ──────────────────────────────────────────────────
-        self._action_table = _make_table(["Pattern", "Command", "GUI Target", "On"])
-        _list_to_table(self._action_table, self._cfg["actions"],
-                       ["pattern", "command", "gui_target", "enabled"])
-        tabs.addTab(self._wrap_table(self._action_table, ["pattern", "command", "gui_target"]), "Actions")
+        # ── Triggers ─────────────────────────────────────────────────
+        folders = self._cfg.get("trigger_folders") or _migrate_actions(self._cfg.get("actions", []))
+        self._trigger_editor = TriggerEditor(folders)
+        tabs.addTab(self._trigger_editor, "Triggers")
 
         # ── Timers ───────────────────────────────────────────────────
         self._timer_table = _make_table(["Name", "Interval (s)", "Command", "On"])
@@ -285,6 +324,37 @@ class ConfigDialog(QDialog):
             self._refresh_preview()
 
         self._theme_combo.currentTextChanged.connect(_on_theme)
+
+        # ── Command-echo colour ───────────────────────────────────────
+        sep_line = QFrame()
+        sep_line.setFrameShape(QFrame.Shape.HLine)
+        sep_line.setStyleSheet("color: #333;")
+        vbox.addWidget(sep_line)
+
+        echo_row = QHBoxLayout()
+        echo_lbl = QLabel("Command echo colour:")
+        echo_lbl.setStyleSheet("color:#aaa; font-size:9pt;")
+        echo_row.addWidget(echo_lbl)
+        echo_c = self._cfg.get("cmd_echo_color", "#e8d44d")
+        self._echo_color_btn = QPushButton()
+        self._echo_color_btn.setFixedSize(48, 22)
+        self._echo_color_btn.setProperty("color", echo_c)
+        self._echo_color_btn.setStyleSheet(
+            f"background:{echo_c}; border:1px solid #555; border-radius:3px;")
+        self._echo_color_btn.setToolTip(echo_c)
+        def _pick_echo_color():
+            chosen = QColorDialog.getColor(
+                QColor(self._echo_color_btn.property("color")), self, "Echo colour")
+            if chosen.isValid():
+                c = chosen.name()
+                self._echo_color_btn.setProperty("color", c)
+                self._echo_color_btn.setStyleSheet(
+                    f"background:{c}; border:1px solid #555; border-radius:3px;")
+                self._echo_color_btn.setToolTip(c)
+        self._echo_color_btn.clicked.connect(_pick_echo_color)
+        echo_row.addWidget(self._echo_color_btn)
+        echo_row.addStretch()
+        vbox.addLayout(echo_row)
         vbox.addStretch()
         return w
 
@@ -352,14 +422,22 @@ class ConfigDialog(QDialog):
     def _save_and_accept(self):
         sep = self._sep_edit.text()
         self._cfg["cmd_separator"] = sep if sep else ";"
+        self._cfg["cmd_echo"]       = self._echo_check.isChecked()
+        self._cfg["cmd_echo_color"] = self._echo_color_btn.property("color")
         self._cfg["palette"]       = [btn.property("color") for btn in self._color_btns]
         self._cfg["palette_theme"] = self._theme_combo.currentText()
+        self._cfg["variables"]  = _table_to_list(self._var_table,    ["name", "value"])
         self._cfg["aliases"]    = _table_to_list(self._alias_table,  ["name", "body", "enabled"])
-        self._cfg["actions"]    = _table_to_list(self._action_table,  ["pattern", "command", "gui_target", "enabled"])
+        self._cfg["trigger_folders"] = self._trigger_editor.get_folders()
         self._cfg["timers"]     = _table_to_list(self._timer_table,   ["name", "interval", "command", "enabled"])
         self._cfg["buttons"]    = _table_to_list(self._button_table,  ["label", "command", "enabled"])
         self._cfg["highlights"] = _table_to_list(self._hl_table,      ["pattern", "color", "enabled"])
+        self.config_saved.emit(copy.deepcopy(self._cfg))
         self.accept()
+
+    def closeEvent(self, event):
+        save_geometry("config_dialog", self)
+        super().closeEvent(event)
 
     def get_config(self) -> dict:
         return copy.deepcopy(self._cfg)

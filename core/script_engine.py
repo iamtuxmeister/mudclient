@@ -161,16 +161,18 @@ class ScriptEngine(QObject):
     gui_message(str, str)     legacy: (target, plain text) for status bar etc.
     """
 
-    send_command = pyqtSignal(str)
-    local_echo   = pyqtSignal(str)
+    send_command   = pyqtSignal(str)   # command from alias / direct body
+    triggered_send = pyqtSignal(str)   # command fired by a trigger
+    local_echo     = pyqtSignal(str)
     showme       = pyqtSignal(str, str)   # (window-target, ansi-coloured text)
     gui_message  = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._aliases:    list[dict] = []
-        self._actions:    list[dict] = []
-        self._highlights: list[dict] = []
+        self._aliases:         list[dict] = []
+        self._trigger_folders: list[dict] = []   # folder-based triggers
+        self._in_trigger: bool = False            # True while running trigger bodies
+        self._highlights:      list[dict] = []
         self._variables:  dict[str, str] = {}
         self._timers:     dict[str, QTimer] = {}
         self._cmd_sep:    str = ';'
@@ -178,9 +180,9 @@ class ScriptEngine(QObject):
     # ── Config ───────────────────────────────────────────────────────
 
     def load_config(self, config: dict):
-        self._aliases    = list(config.get('aliases',    []))
-        self._actions    = list(config.get('actions',    []))
-        self._highlights = list(config.get('highlights', []))
+        self._aliases         = list(config.get('aliases',    []))
+        self._trigger_folders = list(config.get('trigger_folders', []))
+        self._highlights      = list(config.get('highlights', []))
         self._variables  = {
             v['name']: v.get('value', '')
             for v in config.get('variables', [])
@@ -198,7 +200,7 @@ class ScriptEngine(QObject):
     def clear(self):
         self.stop()
         self._aliases.clear()
-        self._actions.clear()
+        self._trigger_folders.clear()
         self._highlights.clear()
         self._variables.clear()
 
@@ -230,41 +232,56 @@ class ScriptEngine(QObject):
 
     def process_line(self, plain: str, raw_ansi: str = '') -> bool:
         """
-        Run all enabled actions against one line of MUD output.
-        Returns True if any action gagged the line (suppress display).
+        Run all enabled triggers against one line of MUD output.
+        Returns True if any trigger gagged the line.
 
         plain    — ANSI-stripped text (for matching)
-        raw_ansi — original coloured text (for %0 in #showme etc.)
+        raw_ansi — original coloured text (available as %%raw in scripts)
+
         """
         gagged = False
-        for action in self._actions:
-            if not action.get('enabled', True):
-                continue
-            pattern = action.get('pattern', '')
-            if not pattern:
-                continue
 
-            captures: list[str] = []
-            matched = False
-            try:
-                m = re.search(pattern, plain)
-                if m:
-                    matched  = True
-                    all_g    = list(m.groups())
-                    captures = [plain] + [g or '' for g in all_g]
-            except re.error:
-                if pattern in plain:
-                    matched  = True
-                    captures = [plain]
+        # ── Global kill-switch: if root folder is disabled, skip all ──
+        root = next((f for f in self._trigger_folders if f.get("_root")), None)
+        if root and not root.get("enabled", True):
+            return False
 
-            if not matched:
+        # ── Folder-based triggers ────────────────────────────────────
+        for folder in self._trigger_folders:
+            if not folder.get('enabled', True):
                 continue
-
-            body   = action.get('body', action.get('command', ''))
-            body   = _subst(body, self._variables, captures)
-            # Make raw ANSI available as special %%raw substitution
-            body   = body.replace('%%raw', raw_ansi)
-            gagged = self._exec_body(body, captures, raw_ansi) or gagged
+            for trig in folder.get('triggers', []):
+                if not trig.get('enabled', True):
+                    continue
+                patterns = trig.get('patterns', [])
+                if not patterns:
+                    continue
+                body = trig.get('body', '')
+                # Try each pattern; fire on first match
+                for pattern in patterns:
+                    if not pattern:
+                        continue
+                    captures: list[str] = []
+                    matched = False
+                    try:
+                        m = re.search(pattern, plain)
+                        if m:
+                            matched  = True
+                            all_g    = list(m.groups())
+                            captures = [plain] + [g or '' for g in all_g]
+                    except re.error:
+                        if pattern in plain:
+                            matched  = True
+                            captures = [plain]
+                    if matched:
+                        b = _subst(body, self._variables, captures)
+                        b = b.replace('%%raw', raw_ansi)
+                        self._in_trigger = True
+                        try:
+                            gagged = self._exec_body(b, captures, raw_ansi) or gagged
+                        finally:
+                            self._in_trigger = False
+                        break
 
         return gagged
 
@@ -290,7 +307,10 @@ class ScriptEngine(QObject):
                     gagged = True
             else:
                 # Bare text → send to MUD
-                self.send_command.emit(cmd)
+                if self._in_trigger:
+                    self.triggered_send.emit(cmd)
+                else:
+                    self.send_command.emit(cmd)
         return gagged
 
     def _exec_tt_cmd(self, cmd: str, captures: list[str], raw_ansi: str) -> bool:
@@ -317,7 +337,10 @@ class ScriptEngine(QObject):
             for part in _split_semi(text):
                 part = part.strip()
                 if part:
-                    self.send_command.emit(part)
+                    if self._in_trigger:
+                        self.triggered_send.emit(part)
+                    else:
+                        self.send_command.emit(part)
             return False
 
         if keyword in ('showme', 'echo'):

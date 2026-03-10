@@ -56,6 +56,7 @@ from ui.right_panel     import RightPanel
 from ui.button_bar      import ButtonBar
 from ui.session_manager import SessionManager, Session, _load_sessions, _save_sessions
 from ui.config_dialog   import ConfigDialog
+from ui.window_settings import save_geometry, restore_geometry
 
 
 # ── Tab completer ─────────────────────────────────────────────────────
@@ -259,7 +260,10 @@ class MainWindow(QMainWindow):
         self._last_host: str = ""
         self._last_port: int = 4000
         self._session:   Session | None = None
-        self._cmd_sep:   str = ";"   # configurable command separator
+        self._config_dlg: object = None     # persistent config dialog
+        self._cmd_sep:    str    = ";"    # configurable command separator
+        self._cmd_echo:       bool = True   # echo sent commands to output
+        self._cmd_echo_color: str  = "#e8d44d"  # light yellow
         self._line_buf:  str = ""    # partial line buffer for line-by-line rendering
 
         self._completer = _TabCompleter()
@@ -267,6 +271,7 @@ class MainWindow(QMainWindow):
         self._engine    = ScriptEngine(self)
 
         self._engine.send_command.connect(self._send_raw_command)
+        self._engine.triggered_send.connect(self._send_triggered_command)
         self._engine.local_echo.connect(self._echo_local)
         self._engine.showme.connect(self._on_showme)
         self._engine.gui_message.connect(self._dispatch_gui_msg)
@@ -278,6 +283,7 @@ class MainWindow(QMainWindow):
 
         # Show session picker as soon as the event loop starts
         from PyQt6.QtCore import QTimer
+        restore_geometry("main_window", self)
         QTimer.singleShot(0, self._show_sessions)
 
     # ── Palette ──────────────────────────────────────────────────────
@@ -441,7 +447,9 @@ class MainWindow(QMainWindow):
 
         # load scripting config
         self._engine.clear()
-        self._cmd_sep = config.get("cmd_separator", ";") or ";"
+        self._cmd_sep        = config.get("cmd_separator", ";") or ";"
+        self._cmd_echo       = config.get("cmd_echo", True)
+        self._cmd_echo_color = config.get("cmd_echo_color", "#e8d44d") or "#e8d44d"
         self._apply_palette(config)
         if config:
             self._engine.load_config(config)
@@ -617,7 +625,15 @@ class MainWindow(QMainWindow):
                 self._send_raw_command(part)
 
     def _send_raw_command(self, cmd: str):
-        """Send text directly to the server (no alias expansion)."""
+        """Send user-typed text to the server — echo as bare text, no brackets."""
+        if self._cmd_echo:
+            self._output.append_local(cmd, self._cmd_echo_color, brackets=False)
+        self._send_signal.emit(cmd)
+
+    def _send_triggered_command(self, cmd: str):
+        """Send a trigger/alias-fired command — echo with brackets."""
+        if self._cmd_echo:
+            self._output.append_local(cmd, self._cmd_echo_color, brackets=True)
         self._send_signal.emit(cmd)
 
     def _echo_local(self, msg: str):
@@ -653,22 +669,34 @@ class MainWindow(QMainWindow):
     # ── Config dialog ────────────────────────────────────────────────
 
     def _show_config(self):
+        # Reuse the dialog if already open — just bring it to front
+        if self._config_dlg is not None and self._config_dlg.isVisible():
+            self._config_dlg.raise_()
+            self._config_dlg.activateWindow()
+            return
         current_config = self._session.config if self._session else {}
         dlg = ConfigDialog(current_config, self)
-        if dlg.exec() == ConfigDialog.DialogCode.Accepted:
-            new_cfg = dlg.get_config()
-            if self._session:
-                self._session.config = new_cfg
-                sessions = _load_sessions()
-                for i, s in enumerate(sessions):
-                    if s.name == self._session.name:
-                        sessions[i] = self._session
-                        break
-                _save_sessions(sessions)
-            self._cmd_sep = new_cfg.get("cmd_separator", ";") or ";"
-            self._apply_palette(new_cfg)
-            self._engine.load_config(new_cfg)
-            self._button_bar.load_buttons(new_cfg.get("buttons", []))
+        dlg.config_saved.connect(self._apply_config)
+        self._config_dlg = dlg
+        restore_geometry("config_dialog", dlg)
+        dlg.show()
+
+    def _apply_config(self, new_cfg: dict):
+        """Apply a saved config dict from the ConfigDialog signal."""
+        if self._session:
+            self._session.config = new_cfg
+            sessions = _load_sessions()
+            for i, s in enumerate(sessions):
+                if s.name == self._session.name:
+                    sessions[i] = self._session
+                    break
+            _save_sessions(sessions)
+        self._cmd_sep        = new_cfg.get("cmd_separator", ";") or ";"
+        self._cmd_echo       = new_cfg.get("cmd_echo", True)
+        self._cmd_echo_color = new_cfg.get("cmd_echo_color", "#e8d44d") or "#e8d44d"
+        self._apply_palette(new_cfg)
+        self._engine.load_config(new_cfg)
+        self._button_bar.load_buttons(new_cfg.get("buttons", []))
 
     # ── Misc ────────────────────────────────────────────────────────
 
@@ -686,5 +714,8 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        save_geometry("main_window", self)
+        if self._config_dlg is not None:
+            self._config_dlg.close()
         self._disconnect()
         super().closeEvent(event)
