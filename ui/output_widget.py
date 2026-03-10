@@ -4,29 +4,39 @@ OutputWidget — scrollable ANSI-aware terminal-style text display.
 Features
 --------
   - Full ANSI SGR colour / style rendering via AnsiState
+  - append_bytes()     : raw byte stream from telnet worker
+  - append_ansi_line() : pre-processed single line (for trigger/gag flow)
+  - append_ansi_text() : arbitrary ANSI string (for #showme)
+  - append_local()     : styled italic client messages
   - Auto-scroll (sticks to bottom unless user scrolls up)
-  - Scrollback split: Ctrl+Return toggles a frozen upper pane plus a
-    live lower pane so you can read history while the game runs
   - Font size zoom: Ctrl+= / Ctrl+-
-  - Highlight injection: words or regex patterns from ScriptEngine
-  - Word-level context menu copy
 """
 
 from __future__ import annotations
 
-import re
-
-from PyQt6.QtCore    import Qt, QPoint
+from PyQt6.QtCore    import Qt
 from PyQt6.QtGui     import (
-    QFont, QTextCharFormat, QTextCursor, QColor, QKeySequence,
+    QFont, QTextCharFormat, QTextCursor, QColor,
     QTextOption,
 )
-from PyQt6.QtWidgets import QTextEdit, QApplication
+from PyQt6.QtWidgets import QTextEdit
 
 from core.ansi_parser import AnsiState, split_ansi
 
 
-_SCROLLBACK_LIMIT = 5_000   # maximum paragraph (block) count
+_SCROLLBACK_LIMIT = 5_000
+
+
+def _parse_codes(codes_str: str) -> list[int]:
+    """Parse a semicolon-separated SGR parameter string to ints."""
+    if not codes_str:
+        return [0]
+    out = []
+    for tok in codes_str.replace(':', ';').split(';'):
+        tok = tok.strip()
+        if tok.isdigit():
+            out.append(int(tok))
+    return out or [0]
 
 
 class OutputWidget(QTextEdit):
@@ -38,20 +48,20 @@ class OutputWidget(QTextEdit):
         self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.setUndoRedoEnabled(False)
         self.document().setMaximumBlockCount(_SCROLLBACK_LIMIT)
-        # Never steal keyboard focus — input line must always keep it.
+        # Never steal keyboard focus
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._font_size  = 11
         self._base_font  = self._make_font()
         self.setFont(self._base_font)
 
-        self._ansi  = AnsiState()
+        self._ansi        = AnsiState()   # persists across calls
         self._auto_scroll = True
 
         self.setStyleSheet("""
             QTextEdit {
                 background-color: #0d0d0d;
-                color: #d8d8d8;
+                color: #aaaaaa;
                 border: none;
                 padding: 4px;
             }
@@ -69,10 +79,10 @@ class OutputWidget(QTextEdit):
         self.verticalScrollBar().rangeChanged.connect(self._on_range_changed)
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-    # ── Font helpers ─────────────────────────────────────────────────
+    # ── Font ─────────────────────────────────────────────────────────
 
     def _make_font(self) -> QFont:
-        f = QFont("Monospace", self._font_size)
+        f = QFont('Monospace', self._font_size)
         f.setStyleHint(QFont.StyleHint.TypeWriter)
         return f
 
@@ -100,22 +110,38 @@ class OutputWidget(QTextEdit):
 
     def scroll_to_bottom(self):
         self._auto_scroll = True
-        sb = self.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
-    # ── Main text intake ─────────────────────────────────────────────
+    # ── Public text intake ───────────────────────────────────────────
 
-    def append_bytes(self, data: bytes):
-        """Decode bytes and render ANSI sequences."""
-        # Strip \r at byte level. MUD servers send \r\n but often interleave
-        # ANSI codes between \r and \n, so string-level replace misses them
-        # and the lone \r becomes a second \n causing double line feeds.
-        data = data.replace(b"\r", b"")
-        text = data.decode("utf-8", errors="replace")
-        self._render(text)
+    def append_ansi_line(self, text: str, newline: bool = True):
+        """
+        Render one ANSI-coloured line.  Called for each complete line
+        from the telnet worker after gag filtering.
+        The internal AnsiState is updated so colour bleeds correctly
+        across chunk boundaries.
+        """
+        cursor = self._end_cursor()
+        self._render_to(cursor, text)
+        if newline:
+            cursor.insertText('\n')
+        self.setTextCursor(cursor)
 
-    def append_local(self, text: str, color: str = "#5599ff"):
-        """Inject a local client message in a distinct colour."""
+    def append_ansi_text(self, text: str):
+        """
+        Render an arbitrary ANSI string (e.g. from #showme).
+        Resets AnsiState before and after so showme output is isolated.
+        """
+        saved = AnsiState()  # snapshot not needed — just reset after
+        cursor = self._end_cursor()
+        self._render_to(cursor, text)
+        # terminate with reset + newline
+        self._ansi.reset()
+        cursor.insertText('\n')
+        self.setTextCursor(cursor)
+
+    def append_local(self, text: str, color: str = '#5599ff'):
+        """Inject a local client message in a distinct italic colour."""
         cursor = self._end_cursor()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
@@ -123,40 +149,36 @@ class OutputWidget(QTextEdit):
         f.setItalic(True)
         fmt.setFont(f)
         cursor.setCharFormat(fmt)
-        cursor.insertText(f"[{text}]\n")
+        cursor.insertText(f'[{text}]\n')
         self.setTextCursor(cursor)
 
     def clear_output(self):
         self.clear()
         self._ansi.reset()
 
-    # ── Rendering ────────────────────────────────────────────────────
+    # ── Internal rendering ───────────────────────────────────────────
 
     def _end_cursor(self) -> QTextCursor:
         c = self.textCursor()
         c.movePosition(QTextCursor.MoveOperation.End)
         return c
 
-    def _render(self, text: str):
-        cursor = self._end_cursor()
+    def _render_to(self, cursor: QTextCursor, text: str):
+        """Render ANSI text into cursor, updating self._ansi state."""
         for codes_str, plain in split_ansi(text):
             if codes_str is not None:
-                # SGR token
-                codes = [int(x) for x in codes_str.split(";") if x] if codes_str else [0]
-                self._ansi.apply_codes(codes)
+                self._ansi.apply_codes(_parse_codes(codes_str))
             if plain:
                 fmt = self._ansi.to_format(self._base_font)
                 cursor.setCharFormat(fmt)
                 cursor.insertText(plain)
-        self.setTextCursor(cursor)
 
-    # ── Keyboard ─────────────────────────────────────────────────────
+    # ── Keyboard / wheel ─────────────────────────────────────────────
 
     def keyPressEvent(self, event):
         key  = event.key()
         mods = event.modifiers()
         ctrl = Qt.KeyboardModifier.ControlModifier
-
         if mods & ctrl:
             if key in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):
                 self.font_larger(); return
@@ -164,12 +186,10 @@ class OutputWidget(QTextEdit):
                 self.font_smaller(); return
             if key == Qt.Key.Key_C:
                 self.copy(); return
-
         super().keyPressEvent(event)
 
     def wheelEvent(self, event):
-        mods = event.modifiers()
-        if mods & Qt.KeyboardModifier.ControlModifier:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             if event.angleDelta().y() > 0:
                 self.font_larger()
             else:

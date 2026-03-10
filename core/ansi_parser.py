@@ -36,32 +36,89 @@ from dataclasses import dataclass, field
 
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat
 
-# ── Standard xterm/VGA 16-colour palette ─────────────────────────────
-# Indices 0-7: normal colours (SGR 30-37 foreground, 40-47 background)
-# Indices 8-15: bright colours (SGR 90-97 foreground, 100-107 background)
-# These values match xterm's hard-coded defaults which MUDs were designed for.
-_PALETTE = [
-    "#000000",  #  0 black
-    "#aa0000",  #  1 red
-    "#00aa00",  #  2 green
-    "#aa5500",  #  3 brown / dark yellow
-    "#0000aa",  #  4 blue
-    "#aa00aa",  #  5 magenta
-    "#00aaaa",  #  6 cyan
-    "#aaaaaa",  #  7 white (light grey)
-    # bright variants
-    "#555555",  #  8 bright black (dark grey)
-    "#ff5555",  #  9 bright red
-    "#55ff55",  # 10 bright green
-    "#ffff55",  # 11 bright yellow
-    "#5555ff",  # 12 bright blue
-    "#ff55ff",  # 13 bright magenta
-    "#55ffff",  # 14 bright cyan
-    "#ffffff",  # 15 bright white
-]
+# ── Built-in colour themes ───────────────────────────────────────────
+# Each theme is a list of 16 hex strings:
+#   indices 0-7  → normal colours  (SGR 30-37 / 40-47)
+#   indices 8-15 → bright colours  (SGR 90-97 / 100-107)
 
-_DEFAULT_FG = "#aaaaaa"   # same as palette[7], xterm default
+THEMES: dict[str, list[str]] = {
+    "xterm": [
+        "#000000","#aa0000","#00aa00","#aa5500",
+        "#0000aa","#aa00aa","#00aaaa","#aaaaaa",
+        "#555555","#ff5555","#55ff55","#ffff55",
+        "#5555ff","#ff55ff","#55ffff","#ffffff",
+    ],
+    "VGA Classic": [
+        "#000000","#800000","#008000","#808000",
+        "#000080","#800080","#008080","#c0c0c0",
+        "#808080","#ff0000","#00ff00","#ffff00",
+        "#0000ff","#ff00ff","#00ffff","#ffffff",
+    ],
+    "Tango": [
+        "#000000","#cc0000","#4e9a06","#c4a000",
+        "#3465a4","#75507b","#06989a","#d3d7cf",
+        "#555753","#ef2929","#8ae234","#fce94f",
+        "#729fcf","#ad7fa8","#34e2e2","#eeeeec",
+    ],
+    "Solarized Dark": [
+        "#073642","#dc322f","#859900","#b58900",
+        "#268bd2","#d33682","#2aa198","#eee8d5",
+        "#002b36","#cb4b16","#586e75","#657b83",
+        "#839496","#6c71c4","#93a1a1","#fdf6e3",
+    ],
+    "Dracula": [
+        "#21222c","#ff5555","#50fa7b","#f1fa8c",
+        "#bd93f9","#ff79c6","#8be9fd","#f8f8f2",
+        "#6272a4","#ff6e6e","#69ff94","#ffffa5",
+        "#d6acff","#ff92df","#a4ffff","#ffffff",
+    ],
+    "Gruvbox Dark": [
+        "#282828","#cc241d","#98971a","#d79921",
+        "#458588","#b16286","#689d6a","#a89984",
+        "#928374","#fb4934","#b8bb26","#fabd2f",
+        "#83a598","#d3869b","#8ec07c","#ebdbb2",
+    ],
+    "Monokai": [
+        "#272822","#f92672","#a6e22e","#f4bf75",
+        "#66d9e8","#ae81ff","#a1efe4","#f8f8f2",
+        "#75715e","#f92672","#a6e22e","#f4bf75",
+        "#66d9e8","#ae81ff","#a1efe4","#f9f8f5",
+    ],
+    "Nord": [
+        "#3b4252","#bf616a","#a3be8c","#ebcb8b",
+        "#81a1c1","#b48ead","#88c0d0","#e5e9f0",
+        "#4c566a","#bf616a","#a3be8c","#ebcb8b",
+        "#81a1c1","#b48ead","#8fbcbb","#eceff4",
+    ],
+    "Custom": None,   # placeholder; filled at runtime
+}
+
+# Active palette — mutable list, starts as xterm
+_PALETTE: list[str] = list(THEMES["xterm"])
+
+_DEFAULT_FG = "#aaaaaa"
 _DEFAULT_BG = ""          # transparent
+
+
+def set_palette(colors: list[str]) -> None:
+    """Replace the active 16-colour palette used by all AnsiState instances."""
+    global _PALETTE, _DEFAULT_FG
+    assert len(colors) == 16, "palette must have exactly 16 entries"
+    _PALETTE[:] = colors
+    _DEFAULT_FG = colors[7]   # normal white = default fg
+
+
+def get_palette() -> list[str]:
+    """Return a copy of the current active palette."""
+    return list(_PALETTE)
+
+
+def palette_name(colors: list[str]) -> str:
+    """Return the theme name matching *colors*, or 'Custom'."""
+    for name, pal in THEMES.items():
+        if pal is not None and list(pal) == list(colors):
+            return name
+    return "Custom"
 
 
 def _256color(n: int) -> str:

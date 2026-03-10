@@ -13,8 +13,10 @@ from PyQt6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QHeaderView, QPushButton,
     QDialogButtonBox, QLabel, QLineEdit, QCheckBox, QSpinBox,
-    QTextEdit, QFormLayout, QMessageBox,
+    QTextEdit, QFormLayout, QMessageBox, QColorDialog,
+    QComboBox, QGridLayout, QFrame,
 )
+from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt
 
 
@@ -54,6 +56,8 @@ _DEFAULT_CONFIG = {
     "variables":     [],
     "buttons":       [],
     "cmd_separator": ";",
+    "palette": None,        # None = use theme name instead
+    "palette_theme": "xterm",
 }
 
 
@@ -130,6 +134,9 @@ class ConfigDialog(QDialog):
         gen_layout.addRow("Command separator:", self._sep_edit)
         tabs.addTab(gen_widget, "General")
 
+        # ── Colors ───────────────────────────────────────────────────
+        tabs.addTab(self._build_colors_tab(), "Colors")
+
         # ── Aliases ──────────────────────────────────────────────────
         self._alias_table = _make_table(["Name", "Body", "On"])
         _list_to_table(self._alias_table, self._cfg["aliases"], ["name", "body", "enabled"])
@@ -166,6 +173,146 @@ class ConfigDialog(QDialog):
         bbox.accepted.connect(self._save_and_accept)
         bbox.rejected.connect(self.reject)
         vbox.addWidget(bbox)
+
+    def _build_colors_tab(self) -> QWidget:
+        """Build the Colors tab: theme dropdown + 16 interactive swatches."""
+        from core.ansi_parser import THEMES, get_palette, palette_name
+
+        w      = QWidget()
+        vbox   = QVBoxLayout(w)
+        vbox.setContentsMargins(16, 16, 16, 16)
+        vbox.setSpacing(14)
+
+        # ── Theme dropdown ────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("Theme:"))
+        self._theme_combo = QComboBox()
+        self._theme_combo.setMaximumWidth(200)
+        for name in THEMES:
+            if name != "Custom":
+                self._theme_combo.addItem(name)
+        self._theme_combo.addItem("Custom")
+
+        # Determine starting theme from saved config
+        saved_pal   = self._cfg.get("palette")
+        saved_theme = self._cfg.get("palette_theme", "xterm")
+        if saved_pal and len(saved_pal) == 16:
+            start_colors = saved_pal
+            start_theme  = palette_name(saved_pal)
+        else:
+            start_colors = list(THEMES.get(saved_theme, THEMES["xterm"]))
+            start_theme  = saved_theme
+
+        idx = self._theme_combo.findText(start_theme)
+        self._theme_combo.setCurrentIndex(max(idx, 0))
+
+        hdr.addWidget(self._theme_combo)
+        hdr.addStretch()
+        vbox.addLayout(hdr)
+
+        # ── Colour grid ───────────────────────────────────────────────
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        _LABELS = [
+            "Black","Red","Green","Yellow",
+            "Blue","Magenta","Cyan","White",
+            "Br.Black","Br.Red","Br.Green","Br.Yellow",
+            "Br.Blue","Br.Magenta","Br.Cyan","Br.White",
+        ]
+        self._color_btns: list[QPushButton] = []
+        for i, (label, color) in enumerate(zip(_LABELS, start_colors)):
+            row_i, col_i = divmod(i, 8)
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#aaa; font-size:8pt;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(lbl, row_i * 2, col_i)
+
+            btn = QPushButton()
+            btn.setFixedSize(48, 28)
+            btn.setProperty("color", color)
+            btn.setStyleSheet(f"background:{color}; border:1px solid #555; border-radius:3px;")
+            btn.setToolTip(f"{label}: {color}")
+
+            def _make_clicker(b):
+                def _click():
+                    current = QColor(b.property("color"))
+                    chosen  = QColorDialog.getColor(current, self, "Pick colour",
+                                QColorDialog.ColorDialogOption.ShowAlphaChannel.__class__
+                                .__bases__[0](0))   # no alpha
+                    chosen  = QColorDialog.getColor(current, self, "Pick colour")
+                    if chosen.isValid():
+                        hex_col = chosen.name()
+                        b.setProperty("color", hex_col)
+                        b.setStyleSheet(
+                            f"background:{hex_col}; border:1px solid #555; border-radius:3px;"
+                        )
+                        b.setToolTip(hex_col)
+                        # Mark combo as Custom
+                        ci = self._theme_combo.findText("Custom")
+                        if ci >= 0:
+                            self._theme_combo.setCurrentIndex(ci)
+                return _click
+
+            btn.clicked.connect(_make_clicker(btn))
+            self._color_btns.append(btn)
+            grid.addWidget(btn, row_i * 2 + 1, col_i)
+
+        vbox.addLayout(grid)
+
+        # ── Preview strip ─────────────────────────────────────────────
+        prev_lbl = QLabel("Preview:")
+        prev_lbl.setStyleSheet("color:#aaa; font-size:8pt; margin-top:6px;")
+        vbox.addWidget(prev_lbl)
+        self._preview_strip = QFrame()
+        self._preview_strip.setFixedHeight(24)
+        self._preview_strip.setFrameShape(QFrame.Shape.StyledPanel)
+        vbox.addWidget(self._preview_strip)
+        self._refresh_preview()
+
+        # When theme dropdown changes → reload all swatches
+        def _on_theme(theme_name: str):
+            if theme_name == "Custom":
+                return
+            pal = THEMES.get(theme_name)
+            if not pal:
+                return
+            for btn, color in zip(self._color_btns, pal):
+                btn.setProperty("color", color)
+                btn.setStyleSheet(
+                    f"background:{color}; border:1px solid #555; border-radius:3px;"
+                )
+                btn.setToolTip(color)
+            self._refresh_preview()
+
+        self._theme_combo.currentTextChanged.connect(_on_theme)
+        vbox.addStretch()
+        return w
+
+    def _refresh_preview(self):
+        """Paint 16 colour squares across the preview strip."""
+        colors = [btn.property("color") for btn in self._color_btns]
+        squares = "".join(
+            f"<span style=\"background:{c}; color:{c}; padding:0 6px;\">&nbsp;&nbsp;</span>"
+            for c in colors
+        )
+        # Use a QLabel trick: set the strip's layout
+        layout = self._preview_strip.layout()
+        if layout is None:
+            from PyQt6.QtWidgets import QHBoxLayout as _HBL
+            layout = _HBL(self._preview_strip)
+            layout.setContentsMargins(2, 2, 2, 2)
+            layout.setSpacing(1)
+            self._prev_labels: list[QLabel] = []
+            for c in colors:
+                lbl = QLabel()
+                lbl.setFixedSize(14, 18)
+                lbl.setStyleSheet(f"background:{c}; border:none;")
+                layout.addWidget(lbl)
+                self._prev_labels.append(lbl)
+            layout.addStretch()
+        else:
+            for lbl, c in zip(self._prev_labels, colors):
+                lbl.setStyleSheet(f"background:{c}; border:none;")
 
     def _wrap_table(self, table: QTableWidget, add_keys: list[str]) -> QWidget:
         """Wrap a table with Add / Remove buttons."""
@@ -205,6 +352,8 @@ class ConfigDialog(QDialog):
     def _save_and_accept(self):
         sep = self._sep_edit.text()
         self._cfg["cmd_separator"] = sep if sep else ";"
+        self._cfg["palette"]       = [btn.property("color") for btn in self._color_btns]
+        self._cfg["palette_theme"] = self._theme_combo.currentText()
         self._cfg["aliases"]    = _table_to_list(self._alias_table,  ["name", "body", "enabled"])
         self._cfg["actions"]    = _table_to_list(self._action_table,  ["pattern", "command", "gui_target", "enabled"])
         self._cfg["timers"]     = _table_to_list(self._timer_table,   ["name", "interval", "command", "enabled"])

@@ -47,6 +47,7 @@ from PyQt6.QtGui   import QFont, QKeyEvent, QAction, QColor, QPalette
 from core.telnet_worker  import TelnetWorker
 from core.script_engine  import ScriptEngine
 from core.map_parser     import MapGraph, try_parse_gmcp_line
+from core.ansi_parser    import set_palette, THEMES, get_palette
 from core.debug          import dbg
 
 from ui.output_widget   import OutputWidget
@@ -259,6 +260,7 @@ class MainWindow(QMainWindow):
         self._last_port: int = 4000
         self._session:   Session | None = None
         self._cmd_sep:   str = ";"   # configurable command separator
+        self._line_buf:  str = ""    # partial line buffer for line-by-line rendering
 
         self._completer = _TabCompleter()
         self._map       = MapGraph()
@@ -266,6 +268,7 @@ class MainWindow(QMainWindow):
 
         self._engine.send_command.connect(self._send_raw_command)
         self._engine.local_echo.connect(self._echo_local)
+        self._engine.showme.connect(self._on_showme)
         self._engine.gui_message.connect(self._dispatch_gui_msg)
 
         self._build_palette()
@@ -439,6 +442,7 @@ class MainWindow(QMainWindow):
         # load scripting config
         self._engine.clear()
         self._cmd_sep = config.get("cmd_separator", ";") or ";"
+        self._apply_palette(config)
         if config:
             self._engine.load_config(config)
 
@@ -542,13 +546,32 @@ class MainWindow(QMainWindow):
 
     def _on_data(self, data: bytes):
         dbg("gui", f"_on_data(): {len(data)} bytes arriving on GUI thread")
-        self._output.append_bytes(data)
+        data = data.replace(b"\r", b"")
         text = data.decode("utf-8", errors="replace")
-        self._completer.feed(text)
-        for line in text.split("\n"):
-            line = line.strip()
-            if line:
-                self._engine.process_line(line)
+
+        # Feed plain words to tab completer
+        self._completer.feed(re.sub(r"\x1b\[[^a-zA-Z]*[a-zA-Z]", "", text))
+
+        # Line-by-line processing: prepend buffered partial, split on \n
+        text = self._line_buf + text
+        self._line_buf = ""
+
+        lines = text.split("\n")
+        # Last element is partial (or empty if text ended with \n)
+        self._line_buf = lines[-1]
+        complete = lines[:-1]
+
+        for line_ansi in complete:
+            plain = re.sub(r"\x1b\[[^a-zA-Z]*[a-zA-Z]", "", line_ansi).strip()
+            gagged = self._engine.process_line(plain, line_ansi)
+            if not gagged:
+                self._output.append_ansi_line(line_ansi)
+
+        # Render partial line (prompt) immediately without trigger processing
+        if self._line_buf:
+            self._output.append_ansi_line(self._line_buf, newline=False)
+            self._line_buf = ""
+
         dbg("gui", "_on_data() done")
 
     def _on_gmcp(self, package: str, payload: object):
@@ -600,6 +623,24 @@ class MainWindow(QMainWindow):
     def _echo_local(self, msg: str):
         self._output.append_local(msg, "#5599ff")
 
+    def _apply_palette(self, config: dict):
+        """Apply the colour palette from config to the ANSI renderer."""
+        pal = config.get("palette")
+        if pal and len(pal) == 16:
+            set_palette(pal)
+        else:
+            theme = config.get("palette_theme", "xterm")
+            theme_pal = THEMES.get(theme, THEMES["xterm"])
+            set_palette(list(theme_pal))
+
+    def _on_showme(self, target: str, ansi_text: str):
+        """Route #showme output — empty target goes to main output."""
+        t = target.lower()
+        if not t or t in ("main", "output"):
+            self._output.append_ansi_text(ansi_text)
+        else:
+            self._right.write_ansi(t, ansi_text)
+
     def _dispatch_gui_msg(self, target: str, message: str):
         t = target.lower()
         if "status" in t:
@@ -625,6 +666,7 @@ class MainWindow(QMainWindow):
                         break
                 _save_sessions(sessions)
             self._cmd_sep = new_cfg.get("cmd_separator", ";") or ";"
+            self._apply_palette(new_cfg)
             self._engine.load_config(new_cfg)
             self._button_bar.load_buttons(new_cfg.get("buttons", []))
 
