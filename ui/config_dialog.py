@@ -21,7 +21,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 
 from ui.window_settings import save_geometry
 
-from ui.trigger_editor import TriggerEditor
+from ui.item_editor   import ItemEditor
 
 
 _DARK = """
@@ -53,18 +53,13 @@ _DARK = """
 """
 
 _DEFAULT_CONFIG = {
-    "aliases":       [],
-    "trigger_folders": [],
-    "timers":        [],
-    "highlights":    [],
-    "variables":     [],
-    "buttons":       [],
-    "cmd_separator": ";",
+    "folders":        [],
+    "highlights":     [],
+    "cmd_separator":  ";",
     "cmd_echo":       True,
-    "cmd_echo_color": "#e8d44d",   # light yellow
-    "variables":      [],
-    "palette": None,        # None = use theme name instead
-    "palette_theme": "xterm",
+    "cmd_echo_color": "#e8d44d",
+    "palette":        None,
+    "palette_theme":  "xterm",
 }
 
 
@@ -109,24 +104,33 @@ def _list_to_table(table: QTableWidget, rows: list[dict], keys: list[str]):
             table.setItem(r, col, item)
 
 
-def _migrate_actions(actions: list[dict]) -> list[dict]:
-    """Convert old flat actions list to the new folder-based structure."""
-    if not actions:
+
+def _migrate_legacy(cfg: dict) -> list[dict]:
+    """Build unified folders from old separate-list config keys."""
+    items = []
+    for a in cfg.get("aliases", []):
+        items.append({"type":"alias","name":a.get("name",""),
+                      "match":a.get("name",""),"body":a.get("body",""),
+                      "enabled":a.get("enabled",True)})
+    for f in cfg.get("trigger_folders",[]):
+        for t in f.get("triggers",[]):
+            items.append({"type":"trigger","name":t.get("name",""),
+                          "patterns":t.get("patterns",[]),
+                          "body":t.get("body",""),"enabled":t.get("enabled",True)})
+    for v in cfg.get("variables",[]):
+        items.append({"type":"variable","name":v.get("name",""),"value":v.get("value","")})
+    for t in cfg.get("timers",[]):
+        items.append({"type":"timer","name":t.get("name",""),
+                      "interval":int(t.get("interval",30)),
+                      "body":t.get("command",t.get("body","")),"enabled":t.get("enabled",True)})
+    for b in cfg.get("buttons",[]):
+        items.append({"type":"button","name":b.get("label",""),
+                      "label":b.get("label",""),"color":"#1e3a1e",
+                      "body":b.get("command",b.get("body","")),"enabled":b.get("enabled",True)})
+    if not items:
         return []
-    triggers = []
-    for a in actions:
-        pattern = a.get("pattern", "") or a.get("body", "")
-        body    = a.get("body", "") or a.get("command", "")
-        # support old key names
-        if not body:
-            body = a.get("command", "")
-        triggers.append({
-            "name":     pattern[:40] if pattern else "Trigger",
-            "patterns": [pattern] if pattern else [],
-            "body":     body,
-            "enabled":  a.get("enabled", True),
-        })
-    return [{"name": "Imported", "enabled": True, "triggers": triggers}]
+    return [{"_root":True,"name":"All","enabled":True,"items":[]},
+            {"name":"Imported","enabled":True,"items":items}]
 
 
 class ConfigDialog(QDialog):
@@ -163,6 +167,15 @@ class ConfigDialog(QDialog):
         )
         gen_layout.addRow("Command separator:", self._sep_edit)
 
+        self._cmd_char_edit = QLineEdit(self._cfg.get("cmd_char", "#"))
+        self._cmd_char_edit.setMaximumWidth(60)
+        self._cmd_char_edit.setToolTip(
+            "Prefix character for client commands.\n"
+            "e.g. '#' means you type  #map find  to use the mapper.\n"
+            "Change to '@' or any character that doesn't conflict with MUD commands."
+        )
+        gen_layout.addRow("Command character:", self._cmd_char_edit)
+
         # Command echo — checkbox only; color lives on the Colors tab
         self._echo_check = QCheckBox("Echo sent commands to output window")
         self._echo_check.setChecked(self._cfg.get("cmd_echo", True))
@@ -172,32 +185,10 @@ class ConfigDialog(QDialog):
         # ── Colors ───────────────────────────────────────────────────
         tabs.addTab(self._build_colors_tab(), "Colors")
 
-        # ── Variables ────────────────────────────────────────────────
-        self._var_table = _make_table(["Variable", "Value"])
-        _list_to_table(self._var_table, self._cfg.get("variables", []), ["name", "value"])
-        tabs.addTab(self._wrap_table(self._var_table, ["name", "value"]), "Variables")
-
-        # ── Aliases ──────────────────────────────────────────────────
-        self._alias_table = _make_table(["Name", "Body", "On"])
-        _list_to_table(self._alias_table, self._cfg["aliases"], ["name", "body", "enabled"])
-        tabs.addTab(self._wrap_table(self._alias_table, ["name", "body"]), "Aliases")
-
-        # ── Triggers ─────────────────────────────────────────────────
-        folders = self._cfg.get("trigger_folders") or _migrate_actions(self._cfg.get("actions", []))
-        self._trigger_editor = TriggerEditor(folders)
-        tabs.addTab(self._trigger_editor, "Triggers")
-
-        # ── Timers ───────────────────────────────────────────────────
-        self._timer_table = _make_table(["Name", "Interval (s)", "Command", "On"])
-        _list_to_table(self._timer_table, self._cfg["timers"],
-                       ["name", "interval", "command", "enabled"])
-        tabs.addTab(self._wrap_table(self._timer_table, ["name", "interval", "command"]), "Timers")
-
-        # ── Buttons ──────────────────────────────────────────────────
-        self._button_table = _make_table(["Label", "Command", "On"])
-        _list_to_table(self._button_table, self._cfg["buttons"],
-                       ["label", "command", "enabled"])
-        tabs.addTab(self._wrap_table(self._button_table, ["label", "command"]), "Buttons")
+        # ── Items (unified: triggers/aliases/variables/timers/buttons) ─
+        folders = self._cfg.get("folders") or _migrate_legacy(self._cfg)
+        self._item_editor = ItemEditor(folders)
+        tabs.addTab(self._item_editor, "Items")
 
         # ── Highlights ───────────────────────────────────────────────
         self._hl_table = _make_table(["Pattern", "Colour", "On"])
@@ -205,10 +196,13 @@ class ConfigDialog(QDialog):
                        ["pattern", "color", "enabled"])
         tabs.addTab(self._wrap_table(self._hl_table, ["pattern", "color"]), "Highlights")
 
-        # ── OK / Cancel ──────────────────────────────────────────────
+        # ── OK / Cancel / Apply ──────────────────────────────────────
         bbox = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        apply_btn = bbox.addButton("Apply", QDialogButtonBox.ButtonRole.ApplyRole)
+        apply_btn.setToolTip("Apply changes and keep window open")
+        apply_btn.clicked.connect(self._apply_only)
         bbox.accepted.connect(self._save_and_accept)
         bbox.rejected.connect(self.reject)
         vbox.addWidget(bbox)
@@ -419,21 +413,28 @@ class ConfigDialog(QDialog):
         layout.addLayout(row)
         return w
 
-    def _save_and_accept(self):
+    def _apply_only(self):
+        """Emit config_saved but keep the dialog open."""
         sep = self._sep_edit.text()
         self._cfg["cmd_separator"] = sep if sep else ";"
+        char = self._cmd_char_edit.text()
+        self._cfg["cmd_char"]      = char if char else "#"
         self._cfg["cmd_echo"]       = self._echo_check.isChecked()
         self._cfg["cmd_echo_color"] = self._echo_color_btn.property("color")
         self._cfg["palette"]       = [btn.property("color") for btn in self._color_btns]
         self._cfg["palette_theme"] = self._theme_combo.currentText()
-        self._cfg["variables"]  = _table_to_list(self._var_table,    ["name", "value"])
-        self._cfg["aliases"]    = _table_to_list(self._alias_table,  ["name", "body", "enabled"])
-        self._cfg["trigger_folders"] = self._trigger_editor.get_folders()
-        self._cfg["timers"]     = _table_to_list(self._timer_table,   ["name", "interval", "command", "enabled"])
-        self._cfg["buttons"]    = _table_to_list(self._button_table,  ["label", "command", "enabled"])
-        self._cfg["highlights"] = _table_to_list(self._hl_table,      ["pattern", "color", "enabled"])
+        self._cfg["folders"]    = self._item_editor.get_folders()
+        self._cfg["highlights"] = _table_to_list(self._hl_table, ["pattern", "color", "enabled"])
         self.config_saved.emit(copy.deepcopy(self._cfg))
+
+    def _save_and_accept(self):
+        self._apply_only()
+        save_geometry("config_dialog", self)
         self.accept()
+
+    def reject(self):
+        save_geometry("config_dialog", self)
+        super().reject()
 
     def closeEvent(self, event):
         save_geometry("config_dialog", self)

@@ -125,6 +125,10 @@ class RightPanel(QWidget):
 
     def update_map(self, ascii_text: str):
         self.map_widget.update_map(ascii_text)
+
+    def on_gmcp_room(self, data: dict):
+        """Called on every Room.Info GMCP packet."""
+        self.map_widget.on_gmcp_room(data)
         self._tabs.setCurrentIndex(0)
 
     def write_ansi(self, target: str, ansi_text: str):

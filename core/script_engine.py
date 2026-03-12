@@ -33,9 +33,14 @@ Color codes (TinTin++ <xyz> format converted to ANSI on the fly)
 from __future__ import annotations
 
 import re
+import logging
 from typing import Optional
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+
+from core.python_engine import PythonEngine, is_python_body, strip_python_sentinel
+
+_trig_log = logging.getLogger("mudclient.triggers")
 
 
 # ── TinTin++ <xyz> colour-code → ANSI ────────────────────────────────────────
@@ -72,7 +77,7 @@ def strip_ansi(text: str) -> str:
 # ── Brace-aware text utilities ────────────────────────────────────────────────
 
 def _split_semi(text: str) -> list[str]:
-    """Split on ';' but not inside {} braces."""
+    """Split on ';' or newline but not inside {} braces."""
     parts: list[str] = []
     depth   = 0
     current: list[str] = []
@@ -83,7 +88,7 @@ def _split_semi(text: str) -> list[str]:
         elif ch == '}':
             depth -= 1
             current.append(ch)
-        elif ch == ';' and depth == 0:
+        elif ch in (';', '\n') and depth == 0:
             parts.append(''.join(current))
             current = []
         else:
@@ -127,13 +132,21 @@ def _parse_args(text: str) -> list[str]:
 def _subst(text: str, variables: dict[str, str], captures: list[str]) -> str:
     """
     Apply variable and capture substitutions:
-      %0   full first capture (or whole match if no groups)
-      %1–%9  numbered captures
+      %0        whole matched line
+      %1–%9     numbered regex capture groups  (TinTin++ style)
+      $1–$9     same numbered captures         (PCRE / user-friendly style)
       $name or ${name}  variable lookup
     """
-    # captures: index 0 = %0, 1 = %1 …
+    # %0–%9 (TinTin++ style)
     for idx in range(min(10, len(captures))):
         text = text.replace(f'%{idx}', captures[idx] if captures[idx] is not None else '')
+
+    # $1–$9 (PCRE style) — must run before $name so $10 etc don't mangle
+    def _cap(m: re.Match) -> str:
+        idx = int(m.group(1))
+        return captures[idx] if idx < len(captures) else ''
+    text = re.sub(r'\$([1-9])', _cap, text)
+
     # ${name} first, then $name (longest-match avoidance)
     text = re.sub(
         r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}',
@@ -169,27 +182,62 @@ class ScriptEngine(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._aliases:         list[dict] = []
-        self._trigger_folders: list[dict] = []   # folder-based triggers
-        self._in_trigger: bool = False            # True while running trigger bodies
-        self._highlights:      list[dict] = []
+        self._folders:    list[dict] = []   # unified folder model
+        self._aliases:    list[dict] = []   # extracted from folders
+        self._triggers:   list[tuple]= []   # (folder_enabled, trig_dict) extracted
+        self._timers_cfg: list[dict] = []   # extracted from folders
+        self._buttons:    list[dict] = []   # extracted from folders
+        self._in_trigger: bool = False
+        self._highlights: list[dict] = []
         self._variables:  dict[str, str] = {}
         self._timers:     dict[str, QTimer] = {}
         self._cmd_sep:    str = ';'
 
+        # Python execution environment
+        self._python = PythonEngine(
+            send_fn       = self._emit_triggered_send,
+            showme_fn     = self.showme.emit,
+            local_echo_fn = self._emit_ansi_echo,
+        )
+
     # ── Config ───────────────────────────────────────────────────────
 
     def load_config(self, config: dict):
-        self._aliases         = list(config.get('aliases',    []))
-        self._trigger_folders = list(config.get('trigger_folders', []))
-        self._highlights      = list(config.get('highlights', []))
-        self._variables  = {
-            v['name']: v.get('value', '')
-            for v in config.get('variables', [])
-            if v.get('name')
-        }
-        self._cmd_sep = config.get('cmd_separator', ';') or ';'
-        self._restart_timers(config.get('timers', []))
+        self._folders    = list(config.get('folders', []))
+        self._highlights = list(config.get('highlights', []))
+        self._cmd_sep    = config.get('cmd_separator', ';') or ';'
+        # Extract typed items from unified folder model
+        self._aliases    = []
+        self._triggers   = []
+        self._timers_cfg = []
+        self._buttons    = []
+        self._variables  = {}
+        root_enabled = True
+        root = next((f for f in self._folders if f.get("_root")), None)
+        if root:
+            root_enabled = root.get("enabled", True)
+        for folder in self._folders:
+            folder_enabled = folder.get("enabled", True) and root_enabled
+            for item in folder.get("items", []):
+                itype = item.get("type", "")
+                if itype == "alias" and item.get("enabled", True):
+                    # normalise: alias uses "match" as the command word
+                    self._aliases.append({
+                        "name":    item.get("match") or item.get("name",""),
+                        "body":    item.get("body",""),
+                        "enabled": folder_enabled,
+                    })
+                elif itype == "trigger" and item.get("enabled", True):
+                    self._triggers.append((folder_enabled, item))
+                elif itype == "variable":
+                    n = item.get("name","").strip()
+                    if n:
+                        self._variables[n] = item.get("value","")
+                elif itype == "timer" and item.get("enabled", True):
+                    self._timers_cfg.append(item)
+                elif itype == "button":
+                    self._buttons.append(item)
+        self._restart_timers(self._timers_cfg)
 
     def set_cmd_sep(self, sep: str):
         self._cmd_sep = sep or ';'
@@ -199,10 +247,24 @@ class ScriptEngine(QObject):
 
     def clear(self):
         self.stop()
+        self._folders.clear()
         self._aliases.clear()
-        self._trigger_folders.clear()
+        self._triggers.clear()
+        self._timers_cfg.clear()
+        self._buttons.clear()
         self._highlights.clear()
         self._variables.clear()
+        self._python.reset_namespace()
+
+    # ── Python engine helpers ────────────────────────────────────────
+
+    def _emit_triggered_send(self, cmd: str):
+        """Used by PythonEngine.send() — always treated as triggered."""
+        self.triggered_send.emit(cmd)
+
+    def _emit_ansi_echo(self, ansi: str):
+        """Used by PythonEngine.log() — route as local_echo."""
+        self.local_echo.emit(ansi)
 
     # ── Public: alias processing ─────────────────────────────────────
 
@@ -241,47 +303,60 @@ class ScriptEngine(QObject):
         """
         gagged = False
 
-        # ── Global kill-switch: if root folder is disabled, skip all ──
-        root = next((f for f in self._trigger_folders if f.get("_root")), None)
-        if root and not root.get("enabled", True):
-            return False
-
-        # ── Folder-based triggers ────────────────────────────────────
-        for folder in self._trigger_folders:
-            if not folder.get('enabled', True):
+        # self._triggers is pre-filtered list of (folder_enabled, trig_dict)
+        # root kill-switch already embedded via folder_enabled=False in load_config
+        for folder_enabled, trig in self._triggers:
+            if not folder_enabled:
                 continue
-            for trig in folder.get('triggers', []):
-                if not trig.get('enabled', True):
+            patterns = trig.get('patterns', [])
+            if not patterns:
+                continue
+            body = trig.get('body', '')
+            for pattern in patterns:
+                if not pattern:
                     continue
-                patterns = trig.get('patterns', [])
-                if not patterns:
-                    continue
-                body = trig.get('body', '')
-                # Try each pattern; fire on first match
-                for pattern in patterns:
-                    if not pattern:
-                        continue
-                    captures: list[str] = []
-                    matched = False
-                    try:
-                        m = re.search(pattern, plain)
-                        if m:
-                            matched  = True
-                            all_g    = list(m.groups())
-                            captures = [plain] + [g or '' for g in all_g]
-                    except re.error:
-                        if pattern in plain:
-                            matched  = True
-                            captures = [plain]
-                    if matched:
+                captures: list[str] = []
+                matched = False
+                try:
+                    m = re.search(pattern, plain)
+                    if m:
+                        matched  = True
+                        all_g    = list(m.groups())
+                        captures = [plain] + [g or '' for g in all_g]
+                        _trig_log.debug("TRIGGER HIT  trig=%r  pattern=%r  plain=%r  captures=%r",
+                                        trig.get('name','?'), pattern, plain, captures)
+                    else:
+                        _trig_log.debug("TRIGGER MISS trig=%r  pattern=%r  plain=%r",
+                                        trig.get('name','?'), pattern, plain)
+                except re.error as _re_err:
+                    _trig_log.debug("TRIGGER RE.ERROR trig=%r  pattern=%r  error=%s  "
+                                    "plain=%r  fallback-match=%r",
+                                    trig.get('name','?'), pattern, _re_err, plain,
+                                    pattern in plain)
+                    if pattern in plain:
+                        matched  = True
+                        captures = [plain]
+                if matched:
+                    _trig_log.debug("TRIGGER EXEC trig=%r  body_raw=%r",
+                                    trig.get('name','?'), body)
+                    if is_python_body(body):
+                        # ── Python path ───────────────────────────────
+                        code = strip_python_sentinel(body)
+                        _trig_log.debug("TRIGGER PYTHON trig=%r  code=%r", trig.get('name','?'), code[:120])
+                        hit = self._python.exec_body(
+                            code, captures, raw_ansi, self._variables)
+                        gagged = gagged or hit
+                    else:
+                        # ── TinTin++ path ─────────────────────────────
                         b = _subst(body, self._variables, captures)
                         b = b.replace('%%raw', raw_ansi)
+                        _trig_log.debug("TRIGGER TINTIN trig=%r  body_subst=%r", trig.get('name','?'), b)
                         self._in_trigger = True
                         try:
                             gagged = self._exec_body(b, captures, raw_ansi) or gagged
                         finally:
                             self._in_trigger = False
-                        break
+                    break
 
         return gagged
 
@@ -289,6 +364,12 @@ class ScriptEngine(QObject):
 
     def get_highlights(self) -> list[dict]:
         return list(self._highlights)
+
+    def get_buttons(self) -> list[dict]:
+        """Return enabled button items for the ButtonBar.
+        Returns dicts with keys: label, color, body, enabled.
+        """
+        return [b for b in self._buttons if b.get("enabled", True)]
 
     # ── Internal: command execution ──────────────────────────────────
 
@@ -324,6 +405,7 @@ class ScriptEngine(QObject):
         keyword  = m.group(1).lower()
         rest     = m.group(2).strip()
         args     = _parse_args(rest)
+        _trig_log.debug("EXEC_CMD keyword=%r  rest=%r  args=%r", keyword, rest, args)
 
         if keyword in ('nop', 'comment'):
             return False
@@ -344,10 +426,21 @@ class ScriptEngine(QObject):
             return False
 
         if keyword in ('showme', 'echo'):
-            ansi_text = args[0] if args else rest
+            # TinTin++ syntax:
+            #   #showme {text}           → main window, text is de-braced
+            #   #showme {text} {window}  → named panel, both de-braced
+            #   #showme bare text        → main window, whole rest is text
+            #   #showme bare text $1 $2  → same (no window arg possible without braces)
+            if rest.startswith('{'):
+                # brace-delimited — first arg is text, optional second is window
+                ansi_text = args[0] if args else ''
+                target    = args[1].lower() if len(args) > 1 else ''
+            else:
+                # no braces — entire rest is the message (substitution already applied)
+                ansi_text = rest
+                target    = ''
             ansi_text = _subst(ansi_text, self._variables, captures)
             ansi_text = tt_color_to_ansi(ansi_text)
-            target    = args[1].lower() if len(args) > 1 else ''
             self.showme.emit(target, ansi_text)
             return False
 
@@ -409,7 +502,7 @@ class ScriptEngine(QObject):
                 continue
             name     = tc.get('name', '')
             interval = int(tc.get('interval', 0))
-            command  = tc.get('command', '')
+            command  = tc.get('body', tc.get('command', ''))
             if interval <= 0 or not command:
                 continue
             t = QTimer(self)

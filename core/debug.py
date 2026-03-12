@@ -43,6 +43,14 @@ def configure(enabled: bool):
     _start   = time.monotonic()
     if enabled:
         _write("debug", "Debug mode ON — logging to stderr")
+        # Route the trigger logger to our stderr output
+        import logging
+        class _TrigHandler(logging.Handler):
+            def emit(self, record):
+                _write("trigger", record.getMessage())
+        _h = _TrigHandler()
+        logging.getLogger("mudclient.triggers").setLevel(logging.DEBUG)
+        logging.getLogger("mudclient.triggers").addHandler(_h)
 
 
 def dbg(category: str, message: str):

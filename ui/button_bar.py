@@ -50,9 +50,14 @@ class ButtonBar(QWidget):
             if not cfg.get("enabled", True):
                 continue
             label   = cfg.get("label",   "?")
-            command = cfg.get("command", "")
+            # support both "body" (new) and "command" (legacy)
+            command = cfg.get("body", cfg.get("command", ""))
+            color   = cfg.get("color", "")
             btn = QPushButton(label)
-            btn.setStyleSheet(self._STYLE)
+            style = self._STYLE
+            if color:
+                style += f"QPushButton {{ background: {color}; }}"
+            btn.setStyleSheet(style)
             btn.setToolTip(command)
             btn.clicked.connect(lambda checked=False, cmd=command: self.command_triggered.emit(cmd))
             self._layout.insertWidget(self._layout.count() - 1, btn)

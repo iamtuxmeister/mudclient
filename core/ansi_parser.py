@@ -94,7 +94,7 @@ THEMES: dict[str, list[str]] = {
 }
 
 # Active palette — mutable list, starts as xterm
-_PALETTE: list[str] = list(THEMES["xterm"])
+_PALETTE: list[str] = list(THEMES["VGA Classic"])
 
 _DEFAULT_FG = "#aaaaaa"
 _DEFAULT_BG = ""          # transparent
@@ -291,3 +291,179 @@ def split_ansi(text: str) -> list[tuple[str | None, str]]:
     if pos < len(text):
         result.append((None, text[pos:]))
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AnsiParser / AnsiSpan / TextStyle — streaming byte-level parser
+# Used by OutputWidget for the direct feed_raw/ingest path.
+# Reads the active 16-colour palette from _PALETTE (shared with AnsiState)
+# so theme changes via set_palette() affect both rendering paths.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import re as _re2
+from dataclasses import dataclass as _dc
+
+def _hex_to_rgb(h: str) -> tuple:
+    c = h.lstrip('#')
+    return (int(c[0:2],16), int(c[2:4],16), int(c[4:6],16))
+
+def _get_c16() -> list:
+    """Return the current 16-colour palette as (r,g,b) tuples from _PALETTE."""
+    return [_hex_to_rgb(h) for h in _PALETTE]
+
+def _build_pal256():
+    p = _get_c16()
+    for r in range(6):
+        for g in range(6):
+            for b in range(6):
+                p.append((0 if r==0 else 55+r*40,
+                           0 if g==0 else 55+g*40,
+                           0 if b==0 else 55+b*40))
+    for i in range(24):
+        v = 8 + i*10; p.append((v,v,v))
+    return p
+
+# _PAL256 is rebuilt dynamically via get_pal256() so theme changes take effect
+def _get_pal256() -> list:
+    return _build_pal256()
+
+
+_CSI_PAT = _re2.compile(rb'\x1b\[[?!>]?[0-9;]*[a-zA-Z@`]')
+_OSC_PAT = _re2.compile(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+@_dc
+class TextStyle:
+    fg: object = None           # (r,g,b) tuple or None
+    bg: object = None
+    _fg_base_idx: int = -1      # 0-7 if set via SGR 30-37 (for bold-bright)
+    bold:          bool = False
+    dim:           bool = False
+    italic:        bool = False
+    underline:     bool = False
+    blink:         bool = False
+    reverse:       bool = False
+    strikethrough: bool = False
+
+    def reset(self):
+        self.fg = self.bg = None
+        self._fg_base_idx = -1
+        self.bold = self.dim = self.italic = self.underline = False
+        self.blink = self.reverse = self.strikethrough = False
+
+    def copy(self):
+        s = TextStyle(fg=self.fg, bg=self.bg, bold=self.bold, dim=self.dim,
+                      italic=self.italic, underline=self.underline,
+                      blink=self.blink, reverse=self.reverse,
+                      strikethrough=self.strikethrough)
+        s._fg_base_idx = self._fg_base_idx
+        return s
+
+
+@_dc
+class AnsiSpan:
+    text:  str
+    style: TextStyle
+
+
+class AnsiParser:
+    """Stateful streaming ANSI/SGR byte-stream → AnsiSpan list converter."""
+
+    def __init__(self):
+        self._style  = TextStyle()
+        self._buf    = b""
+
+    def feed(self, data: bytes) -> list:
+        data = self._buf + data
+        self._buf = b""
+        spans = []
+        pos   = 0
+        n     = len(data)
+
+        while pos < n:
+            esc = data.find(b'\x1b', pos)
+            if esc == -1:
+                t = data[pos:].decode('utf-8', errors='replace')
+                if t: spans.append(AnsiSpan(t, self._style.copy()))
+                break
+            if esc > pos:
+                t = data[pos:esc].decode('utf-8', errors='replace')
+                if t: spans.append(AnsiSpan(t, self._style.copy()))
+            pos = esc
+            if pos + 1 >= n:
+                self._buf = data[pos:]; break
+            nb = data[pos+1:pos+2]
+            if nb == b'[':
+                m = _CSI_PAT.match(data, pos)
+                if m:
+                    if data[m.end()-1:m.end()] == b'm':
+                        self._sgr(data[pos+2:m.end()-1].lstrip(b'?!>'))
+                    pos = m.end()
+                else:
+                    rem = data[pos:]
+                    if len(rem) > 32: pos += 1
+                    else: self._buf = rem; break
+            elif nb == b']':
+                m = _OSC_PAT.match(data, pos)
+                if m: pos = m.end()
+                else:
+                    rem = data[pos:]
+                    if len(rem) > 256: pos += 1
+                    else: self._buf = rem; break
+            else:
+                pos += 2
+
+        return [s for s in spans if s.text]
+
+    def _sgr(self, raw: bytes):
+        s = raw.decode('ascii', errors='replace').strip(';')
+        if not s:
+            self._style.reset(); return
+        params = [int(p) if p.isdigit() else 0 for p in s.split(';')]
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if   p == 0:  self._style.reset()
+            elif p == 1:  self._style.bold = True
+            elif p == 2:  self._style.dim = True
+            elif p == 3:  self._style.italic = True
+            elif p == 4:  self._style.underline = True
+            elif p in (5, 6): self._style.blink = True
+            elif p == 7:  self._style.reverse = True
+            elif p == 9:  self._style.strikethrough = True
+            elif p == 22: self._style.bold = self._style.dim = False
+            elif p == 23: self._style.italic = False
+            elif p == 24: self._style.underline = False
+            elif p == 25: self._style.blink = False
+            elif p == 27: self._style.reverse = False
+            elif p == 29: self._style.strikethrough = False
+            elif p == 39: self._style.fg = None; self._style._fg_base_idx = -1
+            elif p == 49: self._style.bg = None
+            elif 30 <= p <= 37:
+                self._style.fg = _get_c16()[p - 30]
+                self._style._fg_base_idx = p - 30
+            elif p == 38:
+                c, n = self._ext(params, i+1); i += n
+                if c: self._style.fg = c; self._style._fg_base_idx = -1
+            elif 40 <= p <= 47:
+                self._style.bg = _get_c16()[p - 40]
+            elif p == 48:
+                c, n = self._ext(params, i+1); i += n
+                if c: self._style.bg = c
+            elif 90 <= p <= 97:
+                self._style.fg = _get_c16()[p - 82]; self._style._fg_base_idx = -1
+            elif 100 <= p <= 107:
+                self._style.bg = _get_c16()[p - 92]
+            i += 1
+
+    @staticmethod
+    def _ext(params, start):
+        if start >= len(params): return None, 0
+        m = params[start]
+        if m == 5 and start+1 < len(params):
+            return _get_pal256()[params[start+1] % 256], 2
+        if m == 2 and start+3 < len(params):
+            return (params[start+1]&0xFF, params[start+2]&0xFF, params[start+3]&0xFF), 4
+        return None, 1

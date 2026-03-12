@@ -43,6 +43,16 @@ def main():
     app.setApplicationName("MUD Client")
     app.setOrganizationName("mud-client")
     app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QToolTip {
+            background: #1a2e42;
+            color: #cceeff;
+            border: 1px solid #2a5a7a;
+            padding: 2px 8px;
+            font-size: 11px;
+            border-radius: 3px;
+        }
+    """)
 
     dbg("gui", "creating MainWindow")
     win = MainWindow()
