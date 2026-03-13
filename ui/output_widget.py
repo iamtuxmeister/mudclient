@@ -137,14 +137,19 @@ class _Pane(QTextEdit):
             self._cur.insertText(text, _make_fmt(span.style, self._font))
 
     def prepend_spans(self, spans: list):
-        """Insert spans at the very beginning of the document."""
+        """Insert spans at the very beginning of the document.
+
+        Each span is inserted at position 0, so we must iterate in REVERSE
+        order (newest-first) so that after all insertions the oldest span sits
+        at the top of the document and chronological order is preserved.
+        """
         c = QTextCursor(self.document())
-        c.movePosition(QTextCursor.MoveOperation.Start)
-        for span in spans:
+        for span in reversed(spans):
             text = span.text.replace('\r\n', '\n').replace('\r', '')
             if not text:
                 continue
             self._line_count += text.count('\n')
+            c.movePosition(QTextCursor.MoveOperation.Start)
             c.insertText(text, _make_fmt(span.style, self._font))
 
     def trim_to(self, max_lines: int):
@@ -224,6 +229,11 @@ class OutputWidget(QWidget):
         self._pending_spans: list = []
         self._pending_lines: int  = 0
 
+        # Spans that arrive while the split is open — buffered so we never
+        # touch the visible scrollback document mid-browse (causes lag).
+        # Flushed to scrollback on close or when user scrolls to the bottom.
+        self._live_queue: list = []
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -281,8 +291,11 @@ class OutputWidget(QWidget):
 
         # Scrollback handling
         if self._split_active:
-            self._scrollback.append_spans(spans)
-            self._scrollback.trim_to(_SCROLLBACK_MAX)
+            # Don't write to the scrollback widget while the user is browsing —
+            # appending to a large visible QTextEdit causes repaints and cursor
+            # ops that make typing and MUD output feel laggy.
+            # Buffer here; flushed when the split closes or reaches bottom.
+            self._live_queue.extend(spans)
         else:
             self._pending_spans.extend(spans)
             for span in spans:
@@ -351,6 +364,7 @@ class OutputWidget(QWidget):
         self._flush_timer = None
         self._scrollback.clear()
         self._scrollback._line_count = 0
+        self._live_queue = []
         if self._split_tail:
             self._pending_spans.extend(self._split_tail)
             for span in self._split_tail:
@@ -364,6 +378,8 @@ class OutputWidget(QWidget):
             return
         self._split_active = True
         self._scrollback.setVisible(True)
+        self._scrollback.verticalScrollBar().valueChanged.connect(
+            self._on_sb_value_changed)
 
         if self._pending_spans:
             older, tail = self._split_off_tail()
@@ -385,6 +401,20 @@ class OutputWidget(QWidget):
         if not self._split_active:
             return
         self._stop_flush()
+        try:
+            self._scrollback.verticalScrollBar().valueChanged.disconnect(
+                self._on_sb_value_changed)
+        except Exception:
+            pass
+        # Flush any spans that arrived while the user was browsing.
+        # Block signals/updates so the document write is invisible (pane is
+        # about to be hidden anyway) and then trim in one pass.
+        if self._live_queue:
+            self._scrollback.setUpdatesEnabled(False)
+            self._scrollback.append_spans(self._live_queue)
+            self._live_queue = []
+            self._scrollback.trim_to(_SCROLLBACK_MAX)
+            self._scrollback.setUpdatesEnabled(True)
         self._split_active = False
         self._scrollback.setVisible(False)
         self._live.pin_to_bottom()
@@ -409,6 +439,7 @@ class OutputWidget(QWidget):
             pane._line_count = 0
         self._pending_spans.clear()
         self._pending_lines = 0
+        self._live_queue = []
         # Reset both parsers so color state is clean
         self._parser      = AnsiParser()
         self._line_parser = AnsiParser()
@@ -433,6 +464,23 @@ class OutputWidget(QWidget):
             self.font_size = self.font_size - 1
 
     # ── Internal ──────────────────────────────────────────────────────────
+
+    def _flush_live_queue(self):
+        """Append any buffered live spans to the scrollback document.
+        Called when the user reaches the bottom so content is up-to-date
+        before close_split fires.  Safe to call multiple times."""
+        if not self._live_queue:
+            return
+        self._scrollback.append_spans(self._live_queue)
+        self._live_queue = []
+        self._scrollback.trim_to(_SCROLLBACK_MAX)
+
+    def _on_sb_value_changed(self, value: int):
+        """Flush live queue when scrollbar reaches the bottom."""
+        sb = self._scrollback.verticalScrollBar()
+        if value >= sb.maximum() - 5:
+            self._flush_live_queue()
+
 
     def _on_wheel(self, delta_y: int):
         """Called by _WheelRedirectFilter (and _LivePane fallback)."""

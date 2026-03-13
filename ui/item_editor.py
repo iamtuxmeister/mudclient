@@ -67,30 +67,30 @@ _STYLE = """
     QWidget       { background: #1a1a1a; color: #d0d0d0; }
     QTreeWidget {
         background: #111; color: #ccc;
-        border: 1px solid #333; font-size: 10pt;
+        border: 1px solid #333; font-size:12pt;
     }
     QTreeWidget::item { padding: 3px 2px; }
     QTreeWidget::item:selected { background: #1e3a5a; color: #eee; }
     QLineEdit, QSpinBox {
         background: #1e1e1e; color: #ddd;
         border: 1px solid #444; padding: 4px;
-        font-family: Monospace; font-size: 10pt;
+        font-family: Monospace; font-size:12pt;
     }
     QTextEdit {
         background: #141414; color: #ddd;
         border: 1px solid #444; padding: 6px;
-        font-family: Monospace; font-size: 10pt;
+        font-family: Monospace; font-size:12pt;
     }
-    QCheckBox { color: #ccc; font-size: 10pt; }
+    QCheckBox { color: #ccc; font-size:12pt; }
     QPushButton {
         background: #2a2a2a; color: #ccc;
-        border: 1px solid #444; padding: 3px 10px; font-size: 9pt;
+        border: 1px solid #444; padding: 3px 10px; font-size:11pt;
     }
     QPushButton:hover  { background: #363636; }
     QPushButton:pressed{ background: #444; }
-    QLabel { color: #aaa; font-size: 9pt; }
+    QLabel { color: #aaa; font-size:11pt; }
     QLabel#section_label {
-        color: #888; font-size: 8pt; letter-spacing: 1px;
+        color: #888; font-size:10pt; letter-spacing: 1px;
         border-bottom: 1px solid #333; padding-bottom: 3px;
     }
     QTabBar::tab {
@@ -111,10 +111,10 @@ _STYLE = """
 # ── Font helpers ─────────────────────────────────────────────────────────────
 
 def _folder_font(bold: bool = True) -> QFont:
-    f = QFont(); f.setBold(bold); f.setPointSize(10); return f
+    f = QFont(); f.setBold(bold); f.setPointSize(12); return f
 
 def _item_font(strike: bool) -> QFont:
-    f = QFont(); f.setPointSize(10); f.setStrikeOut(strike); return f
+    f = QFont(); f.setPointSize(12); f.setStrikeOut(strike); return f
 
 def _item_color(active: bool) -> QBrush:
     return QBrush(QColor("#ccc") if active else QColor("#555"))
@@ -214,7 +214,7 @@ class ItemEditor(QWidget):
         # Page 0 — placeholder
         ph = QLabel("Select a folder or item to edit")
         ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ph.setStyleSheet("color:#555; font-size:11pt;")
+        ph.setStyleSheet("color:#555; font-size:13pt;")
         self._stack.addWidget(ph)                           # idx 0
 
         # Page 1 — folder editor

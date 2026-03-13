@@ -1,10 +1,19 @@
-"""RightPanel — collapsible panel with a map pane and ANSI-aware text panes."""
+"""
+right_panel.py — Pane widgets used inside QDockWidgets.
+
+The old fixed RightPanel widget is replaced by individual QDockWidgets
+created in MainWindow._build_ui().  This module exports:
+
+  _AnsiPane  — scrolling ANSI-aware text pane (Info / Log)
+  PaneSet    — thin shim wired to the dock widgets so the rest of
+               main_window.py can keep using self._right.*
+"""
 
 from __future__ import annotations
 
 from PyQt6.QtCore    import Qt
 from PyQt6.QtGui     import QFont, QTextOption, QTextCharFormat, QTextCursor, QColor
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QTextEdit, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QSizePolicy
 
 from core.ansi_parser import AnsiState, split_ansi
 from ui.map_widget    import MapWidget
@@ -23,7 +32,7 @@ def _parse_codes(codes_str: str) -> list[int]:
 
 
 class _AnsiPane(QTextEdit):
-    """A read-only, ANSI-rendering text pane for the right panel."""
+    """Scrolling, ANSI-aware read-only text pane."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,7 +42,7 @@ class _AnsiPane(QTextEdit):
         self.document().setMaximumBlockCount(_PANEL_SCROLLBACK)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        f = QFont('Monospace', 9)
+        f = QFont('Monospace', 11)
         f.setStyleHint(QFont.StyleHint.TypeWriter)
         self.setFont(f)
         self._base_font = f
@@ -52,9 +61,10 @@ class _AnsiPane(QTextEdit):
         self.verticalScrollBar().rangeChanged.connect(
             lambda _mn, _mx: self.verticalScrollBar().setValue(_mx)
         )
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Ignored)
 
     def append_ansi(self, text: str):
-        """Render an ANSI-coloured string and append a newline."""
         c = self.textCursor()
         c.movePosition(QTextCursor.MoveOperation.End)
         for codes_str, plain in split_ansi(text):
@@ -64,7 +74,6 @@ class _AnsiPane(QTextEdit):
                 fmt = self._ansi.to_format(self._base_font)
                 c.setCharFormat(fmt)
                 c.insertText(plain)
-        # reset + newline
         self._ansi.reset()
         fmt = QTextCharFormat()
         fmt.setForeground(QColor('#aaaaaa'))
@@ -73,7 +82,6 @@ class _AnsiPane(QTextEdit):
         self.setTextCursor(c)
 
     def append_plain(self, text: str):
-        """Append plain text with a newline."""
         c = self.textCursor()
         c.movePosition(QTextCursor.MoveOperation.End)
         fmt = QTextCharFormat()
@@ -83,75 +91,43 @@ class _AnsiPane(QTextEdit):
         self.setTextCursor(c)
 
 
-class RightPanel(QWidget):
+class PaneSet:
     """
-    Vertical side panel:
-      Tab 0 — ASCII map  (MapWidget)
-      Tab 1 — Info pane  (ANSI-aware, for trigger #showme {text} {info})
-      Tab 2 — Log pane   (ANSI-aware, for GMCP events and #showme {text} {log})
+    Compatibility shim: provides the same API as the old RightPanel
+    but delegates to individual dock-widget contents.
+
+    Wired up in MainWindow._build_ui() after the docks are created.
     """
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumWidth(160)
-        self.setMaximumWidth(400)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+    def __init__(self, map_widget: MapWidget, info_pane: _AnsiPane,
+                 log_pane: _AnsiPane, map_dock, info_dock, log_dock):
+        self.map_widget = map_widget
+        self._info      = info_pane
+        self._log       = log_pane
+        self._map_dock  = map_dock
+        self._info_dock = info_dock
+        self._log_dock  = log_dock
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self._tabs = QTabWidget()
-        self._tabs.setStyleSheet("""
-            QTabWidget::pane { border: none; }
-            QTabBar::tab {
-                background: #1a1a1a; color: #888;
-                padding: 4px 8px; font-size: 9pt;
-            }
-            QTabBar::tab:selected { background: #222; color: #ccc; }
-        """)
-        layout.addWidget(self._tabs)
-
-        self.map_widget = MapWidget()
-        self._tabs.addTab(self.map_widget, 'Map')
-
-        self._info = _AnsiPane()
-        self._tabs.addTab(self._info, 'Info')
-
-        self._log = _AnsiPane()
-        self._tabs.addTab(self._log, 'Log')
-
-    # ── Public write API ─────────────────────────────────────────────
+    def on_gmcp_room(self, data: dict):
+        self.map_widget.on_gmcp_room(data)
+        # Raise the map dock if it's tabbed
+        self._map_dock.raise_()
 
     def update_map(self, ascii_text: str):
         self.map_widget.update_map(ascii_text)
 
-    def on_gmcp_room(self, data: dict):
-        """Called on every Room.Info GMCP packet."""
-        self.map_widget.on_gmcp_room(data)
-        self._tabs.setCurrentIndex(0)
-
     def write_ansi(self, target: str, ansi_text: str):
-        """
-        Route #showme output to the correct pane.
-        target: '' or 'main' → caller handles (main window)
-                'info'       → Info tab
-                'log'        → Log tab
-        """
         t = target.lower()
         if 'info' in t:
             self._info.append_ansi(ansi_text)
-            self._tabs.setCurrentIndex(1)
+            self._info_dock.raise_()
         elif 'log' in t:
             self._log.append_ansi(ansi_text)
-            self._tabs.setCurrentIndex(2)
-        # 'map' and '' are handled by caller
+            self._log_dock.raise_()
 
     def write_info(self, text: str):
-        """Write plain text to the Info pane (GMCP / status messages)."""
         self._info.append_plain(text)
-        self._tabs.setCurrentIndex(1)
+        self._info_dock.raise_()
 
     def write_log(self, text: str):
-        """Write plain text to the Log pane."""
         self._log.append_plain(text)

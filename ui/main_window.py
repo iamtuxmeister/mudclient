@@ -40,9 +40,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLineEdit, QPushButton, QStatusBar,
     QLabel, QApplication, QMessageBox, QInputDialog,
+    QDockWidget, QSizePolicy,
 )
-from PyQt6.QtCore  import Qt, QThread, QObject, QEvent, pyqtSignal
-from PyQt6.QtGui   import QFont, QKeyEvent, QAction, QColor, QPalette
+from PyQt6.QtCore  import Qt, QThread, QObject, QEvent, pyqtSignal, QByteArray, QTimer
+from PyQt6.QtGui   import QFont, QFontMetrics, QKeyEvent, QAction, QColor, QPalette
 
 from core.telnet_worker  import TelnetWorker
 from core.script_engine  import ScriptEngine
@@ -54,7 +55,7 @@ from core.debug          import dbg
 
 from ui.output_widget   import OutputWidget
 from ui.map_widget      import MapWidget
-from ui.right_panel     import RightPanel
+from ui.right_panel     import PaneSet, _AnsiPane
 from ui.button_bar      import ButtonBar
 from ui.session_manager import SessionManager, Session, _load_sessions, _save_sessions
 from ui.config_dialog   import ConfigDialog, _migrate_legacy
@@ -159,7 +160,7 @@ class _InputLine(QLineEdit):
                 border-top: 1px solid #333;
                 padding: 6px 8px;
                 font-family: Monospace;
-                font-size: 11pt;
+                font-size:13pt;
             }
             QLineEdit:focus { border-top: 1px solid #555; }
         """)
@@ -302,11 +303,12 @@ class _WheelRedirectFilter(QObject):
       the input itself, config dialog, item editor, etc.)
     """
 
-    def __init__(self, output_widget, input_widget, main_window, parent=None):
+    def __init__(self, output_widget, input_widget, main_window, canvas=None, parent=None):
         super().__init__(parent)
         self._output = output_widget
         self._input  = input_widget
         self._main   = main_window
+        self._canvas = canvas   # _MapCanvas — if wheel is over this widget, let it zoom
 
     def eventFilter(self, obj, event):
         # ── Click → refocus input ─────────────────────────────────────
@@ -323,6 +325,18 @@ class _WheelRedirectFilter(QObject):
 
         if obj is scrollback or obj is scrollback.viewport():
             return False
+
+        # Let the map canvas handle its own wheel (zoom).
+        # Check by global screen position rather than parent-walking — Qt may
+        # deliver the wheel event to an ancestor (dock container, etc.) rather
+        # than the canvas widget itself, making identity/isinstance checks miss.
+        if self._canvas is not None and self._canvas.isVisible():
+            from PyQt6.QtCore import QRect, QPoint
+            canvas_global = self._canvas.mapToGlobal(QPoint(0, 0))
+            canvas_rect   = QRect(canvas_global, self._canvas.size())
+            cursor_pos    = event.globalPosition().toPoint()
+            if canvas_rect.contains(cursor_pos):
+                return False   # pass through — canvas wheelEvent will zoom
 
         sb = scrollback.verticalScrollBar()
 
@@ -422,10 +436,18 @@ class MainWindow(QMainWindow):
         restore_geometry("main_window", self)
 
         # Wheel filter — route all wheel events through OutputWidget
-        self._wheel_filter = _WheelRedirectFilter(self._output, self._input, self)
+        self._wheel_filter = _WheelRedirectFilter(
+            self._output, self._input, self,
+            canvas=self._right.map_widget._canvas)
         QApplication.instance().installEventFilter(self._wheel_filter)
 
-        QTimer.singleShot(0, self._show_sessions)
+        # Restore dock layout after Qt has finished its initial layout pass.
+        # 150 ms is enough for the event loop to process resize/paint events
+        # that commit the default sizes — then we override with saved state.
+        def _after_show():
+            self._restore_dock_layout()
+            self._show_sessions()
+        QTimer.singleShot(150, _after_show)
 
     # ── Palette ──────────────────────────────────────────────────────
 
@@ -443,25 +465,61 @@ class MainWindow(QMainWindow):
 
     # ── UI construction ──────────────────────────────────────────────
 
+    # ── Dock stylesheet (shared) ──────────────────────────────────────
+    _DOCK_SS = """
+        QDockWidget {
+            color: #bbb;
+            font-size:11pt;
+            titlebar-close-icon: none;
+        }
+        QDockWidget::title {
+            background: #111;
+            padding: 3px 6px;
+            border-bottom: 1px solid #333;
+            text-align: left;
+        }
+        QDockWidget > QWidget {
+            border: none;
+        }
+    """
+
+    def _make_dock(self, title: str, widget: QWidget,
+                   area=Qt.DockWidgetArea.RightDockWidgetArea) -> QDockWidget:
+        """Create a styled, closable-but-restorable dock."""
+        dock = QDockWidget(title, self)
+        dock.setObjectName(f"dock_{title.lower().replace(' ', '_')}")
+        dock.setWidget(widget)
+        dock.setStyleSheet(self._DOCK_SS)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable |
+            QDockWidget.DockWidgetFeature.DockWidgetFloatable |
+            QDockWidget.DockWidgetFeature.DockWidgetClosable,
+        )
+        self.addDockWidget(area, dock)
+        return dock
+
     def _build_ui(self):
+        # ── Allow nested/split docks ──────────────────────────────
+        self.setDockNestingEnabled(True)
+
+        # ── Central widget: output + input ────────────────────────
         central = QWidget()
         self.setCentralWidget(central)
         vbox = QVBoxLayout(central)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(0)
 
-        # Horizontal splitter: output | right panel
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background: #222; width: 3px; }")
-
         self._output = OutputWidget()
-        splitter.addWidget(self._output)
 
-        self._right = RightPanel()
-        splitter.addWidget(self._right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        vbox.addWidget(splitter, 1)
+        # Minimum width = 100 monospace chars
+        _f = QFont("Monospace", 12)
+        _f.setStyleHint(QFont.StyleHint.TypeWriter)
+        _cw = QFontMetrics(_f).averageCharWidth()
+        self._output.setMinimumWidth(_cw * 100)
+        self._output.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        vbox.addWidget(self._output, 1)
 
         # Input row
         input_row = QHBoxLayout()
@@ -478,7 +536,7 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: #1e4a6e; color: #cde;
                 border: none; border-left: 1px solid #333;
-                font-family: Monospace; font-size: 10pt;
+                font-family: Monospace; font-size:12pt;
             }
             QPushButton:hover   { background: #255a84; }
             QPushButton:pressed { background: #1a3a58; }
@@ -492,12 +550,58 @@ class MainWindow(QMainWindow):
         self._button_bar.command_triggered.connect(self._send_command)
         vbox.addWidget(self._button_bar)
 
+        # ── Dock widgets ──────────────────────────────────────────
+        from ui.map_widget import MapWidget
+        _map_widget = MapWidget()
+
+        _info_pane = _AnsiPane()
+        _log_pane  = _AnsiPane()
+
+        _map_dock  = self._make_dock("Map",  _map_widget)
+        _info_dock = self._make_dock("Info", _info_pane)
+        _log_dock  = self._make_dock("Log",  _log_pane)
+
+        # Default layout: Map on top-right, Info+Log tabbed below it
+        self.splitDockWidget(_map_dock, _info_dock,
+                             Qt.Orientation.Vertical)
+        self.tabifyDockWidget(_info_dock, _log_dock)
+        _map_dock.raise_()
+
+        # Expose PaneSet shim so self._right.* keeps working everywhere
+        self._right = PaneSet(
+            map_widget=_map_widget,
+            info_pane=_info_pane,
+            log_pane=_log_pane,
+            map_dock=_map_dock,
+            info_dock=_info_dock,
+            log_dock=_log_dock,
+        )
+        self._dock_map  = _map_dock
+        self._dock_info = _info_dock
+        self._dock_log  = _log_dock
+
+        # Debounced save — any dock move/resize triggers a save 500ms later
+        self._dock_save_timer = QTimer(self)
+        self._dock_save_timer.setSingleShot(True)
+        self._dock_save_timer.setInterval(500)
+        self._dock_save_timer.timeout.connect(self._save_dock_layout)
+        def _schedule_save(_ignored=None):
+            # Guard: don't restart the timer if the window is closing
+            if not self.isVisible():
+                return
+            self._dock_save_timer.start()
+
+        for dock in (_map_dock, _info_dock, _log_dock):
+            dock.dockLocationChanged.connect(_schedule_save)
+            dock.topLevelChanged.connect(_schedule_save)
+            dock.visibilityChanged.connect(_schedule_save)
+
         # Status bar
         self._status_bar = QStatusBar()
         self._status_bar.setStyleSheet("""
             QStatusBar {
                 background: #111; color: #666;
-                font-family: Monospace; font-size: 9pt;
+                font-family: Monospace; font-size:11pt;
                 border-top: 1px solid #1e1e1e;
             }
         """)
@@ -527,6 +631,14 @@ class MainWindow(QMainWindow):
         self._act_disconnect = self._add_action(fm, "&Disconnect", "Ctrl+D",  self._disconnect, enabled=False)
         fm.addSeparator()
         self._add_action(fm, "&Quit", "Ctrl+Q", self.close)
+
+        # View — toggle docks, reset layout
+        vm = bar.addMenu("&View")
+        vm.addAction(self._dock_map.toggleViewAction())
+        vm.addAction(self._dock_info.toggleViewAction())
+        vm.addAction(self._dock_log.toggleViewAction())
+        vm.addSeparator()
+        self._add_action(vm, "Reset Layout", None, self._reset_dock_layout)
 
         # View
         vm = bar.addMenu("&View")
@@ -606,16 +718,24 @@ class MainWindow(QMainWindow):
         self._engine.load_config(config)
         self._button_bar.load_buttons(self._engine.get_buttons())
 
-        # ── Restore map file and last position from session config ──
+        # Defer map auto-load to after the event loop has committed the dock
+        # state.  A singleShot(0) runs once the current call stack unwinds.
         map_path = config.get("map_file")
+        last_room = config.get("map_last_room")
         if map_path and os.path.exists(map_path):
-            ok, msg = self._right.map_widget.load_map_file(map_path)
-            if ok:
-                self._output.append_local(f"Map: auto-loaded {os.path.basename(map_path)}", "#44cc88")
-                last_room = config.get("map_last_room")
-                if last_room and last_room in self._right.map_widget._data.rooms:
-                    self._right.on_gmcp_room({"num": last_room})
-                    self._output.append_local(f"Map: restored position to room #{last_room}", "#44aacc")
+            def _deferred_map_load(mp=map_path, lr=last_room):
+                ok, msg = self._right.map_widget.load_map_file(mp)
+                if ok:
+                    self._output.append_local(
+                        f"Map: auto-loaded {os.path.basename(mp)}", "#44cc88")
+                    if lr and lr in self._right.map_widget._data.rooms:
+                        self._right.on_gmcp_room({"num": lr})
+                        self._output.append_local(
+                            f"Map: restored position to room #{lr}", "#44aacc")
+                # Re-apply dock state after map load — _rebuild_area_combo
+                # triggers a Qt layout pass that clobbers the restored widths.
+                QTimer.singleShot(150, self._restore_dock_layout)
+            QTimer.singleShot(0, _deferred_map_load)
 
         self._output.append_local(f"Connecting to {host}:{port}…", "#c4a000")
 
@@ -664,15 +784,39 @@ class MainWindow(QMainWindow):
 
     def _disconnect(self):
         dbg("gui", "_disconnect() called")
+        # Step 1: sever ALL Qt signal connections from the worker FIRST.
+        # This prevents any already-queued signals (disconnected/data/etc.)
+        # from being delivered to our slots after this point.
         try:
             self._send_signal.disconnect()
         except Exception:
             pass
         if self._worker:
+            for sig in (self._worker.connected, self._worker.disconnected,
+                        self._worker.error, self._worker.data_received,
+                        self._worker.gmcp_received, self._worker.mccp_active):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+            # Step 2: tell the socket to close (triggers recv → EOF in thread)
             self._worker.disconnect()
+
         self._engine.stop()
         self._connected = False
         self._mccp_on   = False
+
+        # Step 3: quit + wait so the thread is dead before we return.
+        # Safe because signals are already disconnected above.
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            if not self._thread.wait(2000):
+                dbg("gui", "thread did not stop in 2 s — terminating")
+                self._thread.terminate()
+                self._thread.wait(500)
+        self._thread = None
+        self._worker = None
+
         self._act_disconnect.setEnabled(False)
         self._act_reconnect.setEnabled(bool(self._last_host))
         self._set_status("Disconnected")
@@ -693,6 +837,11 @@ class MainWindow(QMainWindow):
     def _on_disconnected(self, reason: str):
         dbg("gui", f"_on_disconnected({reason!r}) slot fired")
         self._connected = False
+        if not self.isVisible():
+            # Window is closing — don't touch widgets, just stop the thread
+            if self._thread:
+                self._thread.quit()
+            return
         self._act_disconnect.setEnabled(False)
         self._act_reconnect.setEnabled(bool(self._last_host))
         self._set_status("Disconnected")
@@ -705,6 +854,10 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg: str):
         dbg("gui", f"_on_error({msg!r}) slot fired")
         self._connected = False
+        if not self.isVisible():
+            if self._thread:
+                self._thread.quit()
+            return
         self._act_disconnect.setEnabled(False)
         self._act_reconnect.setEnabled(bool(self._last_host))
         self._set_status(f"Error: {msg}")
@@ -750,8 +903,7 @@ class MainWindow(QMainWindow):
     def _on_gmcp(self, package: str, payload: object):
         room_data = try_parse_gmcp_line(package, payload)
         if room_data:
-            self._map.on_gmcp_room(room_data)
-            self._set_map_room(room_data)
+            self._set_map_room(room_data)   # updates map widget's MapData + persists
         self._right.write_log(f"GMCP {package}")
 
     def _on_mccp_active(self, enabled: bool):
@@ -776,10 +928,97 @@ class MainWindow(QMainWindow):
             self._input.selectAll()
         self._send_command(cmd)
 
+    # Matches: #99 flee  or  #99flee  (cmd_char + digits + optional space + rest)
+    _REPEAT_RE = re.compile(r'^(?P<count>\d+)\s*(?P<body>.+)$')
+
+    # Speedwalk tokens — two patterns tried in order:
+    #   1. digit(s) + two-char diagonal  (e.g. 2ne, 3sw)
+    #   2. optional digit(s) + single direction char
+    # This means bare "sw" in "sws" is parsed as s+w+s not sw+s.
+    _SW_DIAG_RE   = re.compile(r'(\d+)(ne|nw|se|sw)',           re.IGNORECASE)
+    _SW_SINGLE_RE = re.compile(r'(\d*)(n|s|e|w|u|d)',           re.IGNORECASE)
+
+    _SW_EXPAND: dict = {
+        'n': 'north', 's': 'south', 'e': 'east', 'w': 'west',
+        'u': 'up',    'd': 'down',
+        'ne': 'northeast', 'nw': 'northwest',
+        'se': 'southeast', 'sw': 'southwest',
+    }
+
+    def _expand_speedwalk(self, text: str) -> list[str] | None:
+        """Parse a .speedwalk string into a list of direction commands.
+        Returns None if the string isn't a valid speedwalk (unknown chars remain).
+
+        Two-char diagonals (ne/nw/se/sw) only match when an explicit digit count
+        precedes them, so 'sws' → s,w,s and '2sw' → sw,sw.
+
+        e.g. '.2s5esws'  → s,s,e,e,e,e,e,s,w,s
+             '.3ne2sw'   → ne,ne,ne,sw,sw
+        """
+        if not text.startswith('.'):
+            return None
+        body = text[1:]
+        if not body:
+            return None
+        dirs = []
+        pos  = 0
+        while pos < len(body):
+            # Try digit+diagonal first
+            m = self._SW_DIAG_RE.match(body, pos)
+            if m:
+                count = int(m.group(1))
+                dirs.extend([self._SW_EXPAND[m.group(2).lower()]] * count)
+                pos = m.end()
+                continue
+            # Try optional-digit + single char
+            m = self._SW_SINGLE_RE.match(body, pos)
+            if m:
+                count = int(m.group(1)) if m.group(1) else 1
+                dirs.extend([self._SW_EXPAND[m.group(2).lower()]] * count)
+                pos = m.end()
+                continue
+            return None   # unexpected character — not a speedwalk
+        return dirs if dirs else None
+
     def _send_command(self, cmd: str):
         """Entry point for all user-initiated commands."""
         if not cmd:
             return
+
+        # ── .speedwalk expansion ─────────────────────────────────────
+        # Check before cmd_char dispatch so ".2n3s" isn't treated as text.
+        # Only applies when the whole input is a single speedwalk token.
+        stripped = cmd.strip()
+        dirs = self._expand_speedwalk(stripped)
+        if dirs is not None:
+            if not self._connected:
+                self._output.append_local("Not connected — use File → Sessions or Quick Connect", "#c4a000")
+                return
+            for d in dirs:
+                self._send_raw_command(d)
+            return
+
+        # ── #N repeat expansion ──────────────────────────────────────
+        # #99 flee  → send "flee" 99 times.
+        # Only fires when the rest of the token is NOT a known client command.
+        if stripped.startswith(self._cmd_char):
+            after = stripped[len(self._cmd_char):]
+            m = self._REPEAT_RE.match(after)
+            if m:
+                count = min(int(m.group('count')), 999)  # sanity cap
+                body  = m.group('body').strip()
+                # Make sure it's not a real client command like #map
+                if not self._commands.dispatch(stripped):
+                    if not self._connected:
+                        self._output.append_local("Not connected — use File → Sessions or Quick Connect", "#c4a000")
+                        return
+                    parts = [p.strip() for p in body.split(self._cmd_sep) if p.strip()]
+                    for _ in range(count):
+                        for part in parts:
+                            if not self._engine.process_alias(part):
+                                self._send_raw_command(part)
+                return
+
         # Client commands (start with command char) are handled locally
         if self._commands.dispatch(cmd):
             return
@@ -851,61 +1090,63 @@ class MainWindow(QMainWindow):
         """
         Called every time the room detector sees a complete Exits: block.
 
-        The critical distinction: Exits: lines appear after MOVEMENTS but also
-        after look, scan, failed moves, etc.  We must not consume a queue entry
-        for stationary output.
+        Priority order (most reliable → least):
+        1. Direction-following: current_room.exits[direction] → dest
+           Trusted unconditionally when we have a queued direction and a
+           current room — the map graph is always more reliable than name
+           matching, especially with duplicate room names.
+        2. Name+exits lookup restricted to adjacent rooms only.
+           Used only when there is no queued direction (look, scan, teleport).
 
-        Strategy
-        --------
-        1. Run name+exits lookup first to discover what room this block is for.
-        2. If the result is the SAME as the current room (and not a forced sync)
-           it is stationary output — do NOT pop the queue, just return.
-        3. If the result is a DIFFERENT room (or lookup failed), it is a real
-           room change — pop from queue and use direction-following to confirm,
-           or accept the lookup result directly.
+        Stationary guard: if the detected room equals the current room
+        (look, scan, failed move) we do NOT pop the queue.
         """
         map_data = self._right.map_widget._data
-        near     = None if forced else map_data.current_id
+        cur      = map_data.current
+        cur_id   = map_data.current_id
 
-        # ── Step 1: name+exits lookup ─────────────────────────────────
-        detected_id = map_data.find_by_name_and_exits(name, exits, near_id=near)
+        # Peek at the queue without popping yet
+        pending = self._move_queue[0] if self._move_queue else None
 
-        # ── Step 2: stationary guard ──────────────────────────────────
-        # If the lookup found the current room, this Exits: was from look/scan/
-        # a failed move — don't consume a queue entry.
+        # ── Step 1: direction-following (primary, unconditional) ──────
+        # Trust the map graph edge — never fall through to name search when
+        # we have a queued direction, as duplicate names cause wrong jumps.
+        if not forced and pending and cur is not None:
+            kind, value = pending
+            dest_id = None
+            if kind == "dir":
+                dest_id = cur.exits.get(value)
+            elif kind == "special":
+                for exit_name, eid in cur.exits.items():
+                    if _special_exit_matches(exit_name.lower(), value):
+                        dest_id = eid
+                        break
+            # Consume the queue entry regardless of whether the exit is mapped
+            self._move_queue.pop(0)
+            if dest_id and dest_id in map_data.rooms:
+                self._set_map_room({"num": dest_id})
+                self._walk_tick()
+            # If exit not in map, position unknown — don't jump elsewhere
+            return
+
+        # ── Step 2: name+exits lookup (no queued direction) ───────────
+        # Only runs when no direction was queued: teleport, script move, etc.
+        # Restrict to adjacent rooms to minimise false positives.
+        near_id     = None if forced else cur_id
+        detected_id = map_data.find_by_name_and_exits(name, exits, near_id=near_id)
+
+        # Stationary guard — same room as current → look/scan/failed move
         if (not forced
                 and detected_id is not None
-                and detected_id == map_data.current_id):
-            return   # position already confirmed, queue intact
+                and detected_id == cur_id):
+            return
 
-        # ── Step 3: real room change — pop queue and navigate ─────────
-        pending = self._move_queue.pop(0) if self._move_queue else None
-
-        # If the lookup already found a destination, trust it
         if detected_id is not None:
             self._set_map_room({"num": detected_id})
             self._walk_tick()
             return
 
-        # Lookup failed — use direction following as fallback
-        if pending and not forced:
-            cur = map_data.current
-            if cur is not None:
-                kind, value = pending
-                if kind == "dir":
-                    dest_id = cur.exits.get(value)
-                    if dest_id and dest_id in map_data.rooms:
-                        self._set_map_room({"num": dest_id})
-                        self._walk_tick()
-                        return
-                elif kind == "special":
-                    for exit_name, dest_id in cur.exits.items():
-                        if _special_exit_matches(exit_name.lower(), value):
-                            if dest_id in map_data.rooms:
-                                self._set_map_room({"num": dest_id})
-                                self._walk_tick()
-                                return
-
+        # ── Step 3: nothing worked ────────────────────────────────────
         if forced:
             self._output.append_local(
                 f"Map: could not find '{name}' with exits "
@@ -1079,6 +1320,48 @@ class MainWindow(QMainWindow):
         if room_id is not None:
             self._save_session_map(room_id=int(room_id))
 
+    # ── Dock layout persistence ──────────────────────────────────────
+
+    def _save_dock_layout(self):
+        """Save dock state + geometry to window_settings.json.
+        Called synchronously on close and debounced on dock moves."""
+        try:
+            from ui.window_settings import load_settings, save_settings
+            geom  = self.saveGeometry()
+            state = self.saveState(version=1)
+            data  = load_settings()
+            data["main_window"] = geom.toHex().data().decode()
+            data["dock_state"]  = state.toBase64().data().decode()
+            save_settings(data)
+            dbg("gui", f"dock layout saved ({len(state)} bytes state)")
+        except Exception as e:
+            dbg("gui", f"_save_dock_layout error: {e}")
+
+    def _reset_dock_layout(self):
+        """Restore the default dock arrangement."""
+        # Re-dock everything to right, then re-split
+        for dock in (self._dock_map, self._dock_info, self._dock_log):
+            dock.setFloating(False)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            dock.show()
+        self.splitDockWidget(self._dock_map, self._dock_info,
+                             Qt.Orientation.Vertical)
+        self.tabifyDockWidget(self._dock_info, self._dock_log)
+        self._dock_map.raise_()
+
+    def _restore_dock_layout(self):
+        """Restore dock state from window_settings.json."""
+        try:
+            from ui.window_settings import load_settings
+            data = load_settings()
+            state_b64 = data.get("dock_state")
+            if state_b64:
+                ok = self.restoreState(
+                    QByteArray.fromBase64(state_b64.encode()), version=1)
+                dbg("gui", f"restoreState → {ok}")
+        except Exception as e:
+            dbg("gui", f"_restore_dock_layout error: {e}")
+
     def _save_session_map(self, map_path: str = None, room_id: int = None):
         """Persist map file path and/or last room ID into the current session."""
         if self._session is None:
@@ -1133,8 +1416,44 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
-        save_geometry("main_window", self)
-        if self._config_dlg is not None:
-            self._config_dlg.close()
-        self._disconnect()
+        # 0. Stop script engine timers FIRST — they can fire triggered_send
+        #    which touches output/status widgets during teardown (segfault).
+        try:
+            self._engine.stop()
+        except Exception:
+            pass
+
+        # 1. Kill the debounced save timer immediately so it cannot fire
+        #    while Qt is tearing down widgets (causes segfault via
+        #    visibilityChanged → timer.start → _save_dock_layout on dead widget).
+        try:
+            self._dock_save_timer.stop()
+            self._dock_save_timer.timeout.disconnect()
+        except Exception:
+            pass
+        # Disconnect dock signals that would restart the timer
+        for dock in (self._dock_map, self._dock_info, self._dock_log):
+            try:
+                dock.dockLocationChanged.disconnect()
+                dock.topLevelChanged.disconnect()
+                dock.visibilityChanged.disconnect()
+            except Exception:
+                pass
+
+        # 2. Save synchronously now while all widgets still exist
+        self._save_dock_layout()
+
+        # 3. Close child dialogs
+        try:
+            if self._config_dlg is not None:
+                self._config_dlg.close()
+        except Exception:
+            pass
+
+        # 4. Disconnect telnet
+        try:
+            self._disconnect()
+        except Exception:
+            pass
+
         super().closeEvent(event)

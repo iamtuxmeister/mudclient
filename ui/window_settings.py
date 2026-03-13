@@ -1,9 +1,7 @@
 """
-window_settings.py — persist window geometry across sessions.
+window_settings.py — persist window geometry and dock state.
 
-Saves to ~/.config/mud-client/window_settings.json as plain hex strings
-produced by QWidget.saveGeometry(), which encodes position, size, and
-maximised/fullscreen state in a Qt-portable binary blob.
+Saves to ~/.config/mud-client/window_settings.json.
 """
 
 from __future__ import annotations
@@ -11,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 
-from PyQt6.QtCore  import QByteArray
+from PyQt6.QtCore    import QByteArray
 from PyQt6.QtWidgets import QWidget
 
 _FILE = os.path.join(
@@ -19,7 +17,7 @@ _FILE = os.path.join(
 )
 
 
-def _load() -> dict:
+def load_settings() -> dict:
     try:
         with open(_FILE) as f:
             return json.load(f)
@@ -27,27 +25,28 @@ def _load() -> dict:
         return {}
 
 
-def _save(data: dict) -> None:
+def save_settings(data: dict) -> None:
     os.makedirs(os.path.dirname(_FILE), exist_ok=True)
     with open(_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
+# Short aliases used by main_window inline imports
+_load = load_settings
+_save = save_settings
+
+
 def save_geometry(key: str, widget: QWidget) -> None:
-    """Persist *widget*'s current geometry under *key*."""
-    data = _load()
+    """Persist widget's current geometry under key."""
+    data = load_settings()
     data[key] = widget.saveGeometry().toHex().data().decode()
-    _save(data)
+    save_settings(data)
 
 
 def restore_geometry(key: str, widget: QWidget) -> bool:
-    """
-    Restore *widget*'s geometry from *key*.
-    Returns True if geometry was found and applied.
-    """
-    data = _load()
+    """Restore widget's geometry from key. Returns True if found."""
+    data = load_settings()
     hex_str = data.get(key)
     if not hex_str:
         return False
-    blob = QByteArray.fromHex(hex_str.encode())
-    return widget.restoreGeometry(blob)
+    return widget.restoreGeometry(QByteArray.fromHex(hex_str.encode()))

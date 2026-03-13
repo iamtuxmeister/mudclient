@@ -188,6 +188,7 @@ class ScriptEngine(QObject):
         self._timers_cfg: list[dict] = []   # extracted from folders
         self._buttons:    list[dict] = []   # extracted from folders
         self._in_trigger: bool = False
+        self._in_alias:   int  = 0   # depth counter; prevents alias→alias recursion
         self._highlights: list[dict] = []
         self._variables:  dict[str, str] = {}
         self._timers:     dict[str, QTimer] = {}
@@ -286,7 +287,11 @@ class ScriptEngine(QObject):
             captures = [''] + args[:9]           # %0 unused; %1-%9=args
             captures[0] = args_str               # %0 = full args string
             body     = _subst(body, self._variables, captures)
-            self._exec_body(body, captures, '')
+            self._in_alias += 1
+            try:
+                self._exec_body(body, captures, '')
+            finally:
+                self._in_alias -= 1
             return True
         return False
 
@@ -387,11 +392,16 @@ class ScriptEngine(QObject):
                 if self._exec_tt_cmd(cmd, captures, raw_ansi):
                     gagged = True
             else:
-                # Bare text → send to MUD
-                if self._in_trigger:
-                    self.triggered_send.emit(cmd)
+                # Bare text: if we're not already inside an alias body, try
+                # alias expansion (lets triggers call aliases by name).
+                # _in_alias guards against infinite alias→alias recursion.
+                if not self._in_alias and self.process_alias(cmd):
+                    pass  # alias handled it
                 else:
-                    self.send_command.emit(cmd)
+                    if self._in_trigger:
+                        self.triggered_send.emit(cmd)
+                    else:
+                        self.send_command.emit(cmd)
         return gagged
 
     def _exec_tt_cmd(self, cmd: str, captures: list[str], raw_ansi: str) -> bool:

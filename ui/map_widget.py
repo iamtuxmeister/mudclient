@@ -102,7 +102,9 @@ class _MapCanvas(QWidget):
     # ── View helpers ──────────────────────────────────────────────────
 
     def fit_rooms(self, rooms: list[MRoom]):
-        """Fit all given rooms into the viewport."""
+        """Fit all given rooms into the viewport.
+        If the canvas has no real size yet (hidden dock), store the rooms
+        and re-fit on the next resizeEvent."""
         if not rooms:
             return
         xs = [r.x for r in rooms]
@@ -111,12 +113,26 @@ class _MapCanvas(QWidget):
         cy = (min(ys) + max(ys)) / 2
         self._offset = QPointF(cx, cy)
 
+        if self.width() < 10 or self.height() < 10:
+            # Canvas not laid out yet — store and defer
+            self._pending_fit_rooms = list(rooms)
+            return
+
+        self._pending_fit_rooms = None
         span_x = max(max(xs) - min(xs) + 2, 1)
         span_y = max(max(ys) - min(ys) + 2, 1)
         zoom_x = self.width()  / (span_x * STRIDE)
         zoom_y = self.height() / (span_y * STRIDE)
         self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, min(zoom_x, zoom_y) * 0.85))
         self.update()
+
+    def resizeEvent(self, event):
+        """If a fit was deferred (canvas had no size), execute it now."""
+        super().resizeEvent(event)
+        if getattr(self, "_pending_fit_rooms", None):
+            rooms = self._pending_fit_rooms
+            self._pending_fit_rooms = None
+            self.fit_rooms(rooms)
 
     def center_on_room(self, room: MRoom):
         """Pan to put a room in the centre without changing zoom."""
@@ -180,8 +196,8 @@ class _MapCanvas(QWidget):
             # Up/down indicators (small triangles inside room)
             self._draw_vz_indicators(p, room, rect, room_ids)
 
-            # Room label if zoomed in enough
-            if self._zoom >= 1.2 and room.name:
+            # Room label only for hovered room
+            if room is self._hovered_room and room.name:
                 p.setPen(QPen(C_TEXT if not is_current else QColor(0xff,0x88,0x88)))
                 font = QFont("sans-serif", max(5, int(7 * self._zoom)))
                 p.setFont(font)
@@ -276,7 +292,7 @@ class _MapCanvas(QWidget):
             exits = ", ".join(cur.exits.keys()) if cur.exits else "none"
             msg = f"Room #{cur.id}\n{cur.name or '(unnamed)'}\nExits: {exits}"
         p.setPen(QPen(C_DIM))
-        p.setFont(QFont("Monospace", 10))
+        p.setFont(QFont("Monospace", 12))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, msg)
 
     # ── Interaction ───────────────────────────────────────────────────
@@ -286,7 +302,7 @@ class _MapCanvas(QWidget):
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        factor = 1.12 if delta > 0 else 1 / 1.12
+        factor = 1 / 1.12 if delta > 0 else 1.12
         # World pos under cursor before zoom
         mw = self._screen_to_world(event.position().x(), event.position().y())
         self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -399,6 +415,16 @@ class MapWidget(QWidget):
 
         self._build_ui()
 
+        # Never let content changes drive the dock size.
+        # The dock splitter controls our dimensions, not our sizeHint.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Ignored)
+
+    def sizeHint(self):
+        """Return a stable hint so Qt stops trying to resize us."""
+        from PyQt6.QtCore import QSize
+        return QSize(300, 400)
+
     # ── UI Construction ───────────────────────────────────────────────
 
     def _build_ui(self):
@@ -416,10 +442,10 @@ class MapWidget(QWidget):
         def _btn(label, tip, slot):
             b = QPushButton(label)
             b.setToolTip(tip)
-            b.setFixedHeight(22)
+            b.setFixedHeight(24)
             b.setStyleSheet("""
                 QPushButton{background:#1e1e1e;color:#aaa;border:1px solid #444;
-                            border-radius:3px;padding:0 6px;font-size:11px;}
+                            border-radius:3px;padding:0 6px;font-size:13px;}
                 QPushButton:hover{background:#2a2a2a;color:#ccc;}
                 QPushButton:pressed{background:#333;}
             """)
@@ -433,15 +459,15 @@ class MapWidget(QWidget):
         tb_lay.addSpacing(8)
 
         lbl = QLabel("Area:")
-        lbl.setStyleSheet("color:#666; font-size:11px;")
+        lbl.setStyleSheet("color:#666; font-size:13px;")
         tb_lay.addWidget(lbl)
 
         self._area_combo = QComboBox()
-        self._area_combo.setFixedHeight(22)
-        self._area_combo.setMinimumWidth(140)
+        self._area_combo.setFixedHeight(24)
+        self._area_combo.setFixedWidth(160)   # fixed — prevents dock resize on map load
         self._area_combo.setStyleSheet("""
             QComboBox{background:#1e1e1e;color:#aaa;border:1px solid #444;
-                      border-radius:3px;font-size:11px;}
+                      border-radius:3px;font-size:13px;}
             QComboBox QAbstractItemView{background:#111;color:#aaa;
                                         selection-background-color:#333;}
         """)
@@ -451,7 +477,7 @@ class MapWidget(QWidget):
         tb_lay.addSpacing(8)
 
         lbl2 = QLabel("Z:")
-        lbl2.setStyleSheet("color:#666; font-size:11px;")
+        lbl2.setStyleSheet("color:#666; font-size:13px;")
         tb_lay.addWidget(lbl2)
 
         self._z_down = _btn("▼", "Z level down", self._z_dec)
@@ -459,7 +485,7 @@ class MapWidget(QWidget):
         self._z_label = QLabel("0")
         self._z_label.setFixedWidth(30)
         self._z_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._z_label.setStyleSheet("color:#aaa; font-size:11px;")
+        self._z_label.setStyleSheet("color:#aaa; font-size:13px;")
         self._z_up = _btn("▲", "Z level up", self._z_inc)
         self._z_up.setFixedWidth(24)
         tb_lay.addWidget(self._z_down)
@@ -469,7 +495,7 @@ class MapWidget(QWidget):
         tb_lay.addStretch(1)
 
         self._status_label = QLabel("")
-        self._status_label.setStyleSheet("color:#555; font-size:10px;")
+        self._status_label.setStyleSheet("color:#555; font-size:12px;")
         tb_lay.addWidget(self._status_label)
 
         root.addWidget(tb)

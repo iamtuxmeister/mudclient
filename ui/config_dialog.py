@@ -256,7 +256,7 @@ class ConfigDialog(QDialog):
         for i, (label, color) in enumerate(zip(_LABELS, start_colors)):
             row_i, col_i = divmod(i, 8)
             lbl = QLabel(label)
-            lbl.setStyleSheet("color:#aaa; font-size:8pt;")
+            lbl.setStyleSheet("color:#aaa; font-size:10pt;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             grid.addWidget(lbl, row_i * 2, col_i)
 
@@ -294,7 +294,7 @@ class ConfigDialog(QDialog):
 
         # ── Preview strip ─────────────────────────────────────────────
         prev_lbl = QLabel("Preview:")
-        prev_lbl.setStyleSheet("color:#aaa; font-size:8pt; margin-top:6px;")
+        prev_lbl.setStyleSheet("color:#aaa; font-size:10pt; margin-top:6px;")
         vbox.addWidget(prev_lbl)
         self._preview_strip = QFrame()
         self._preview_strip.setFixedHeight(24)
@@ -327,7 +327,7 @@ class ConfigDialog(QDialog):
 
         echo_row = QHBoxLayout()
         echo_lbl = QLabel("Command echo colour:")
-        echo_lbl.setStyleSheet("color:#aaa; font-size:9pt;")
+        echo_lbl.setStyleSheet("color:#aaa; font-size:11pt;")
         echo_row.addWidget(echo_lbl)
         echo_c = self._cfg.get("cmd_echo_color", "#e8d44d")
         self._echo_color_btn = QPushButton()

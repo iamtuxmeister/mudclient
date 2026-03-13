@@ -21,7 +21,7 @@ class ButtonBar(QWidget):
             border: 1px solid #333;
             padding: 3px 8px;
             font-family: Monospace;
-            font-size: 9pt;
+            font-size:11pt;
         }
         QPushButton:hover { background: #2a2a2a; color: #ccc; border-color: #555; }
         QPushButton:pressed { background: #333; color: #eee; }
