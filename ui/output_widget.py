@@ -1,37 +1,36 @@
 """
 OutputWidget — ANSI-aware split scrollback display.
 
-Ported directly from the reference tintin-gui implementation.
-
 Architecture
 ------------
-Two panes share content via an AnsiParser / AnsiSpan pipeline:
+Two panes, two separate documents:
 
   _LivePane (bottom)
     - No vertical scrollbar; always pinned to latest output
-    - Capped at _LIVE_MAX_LINES to stay fast
-    - Never scrolls on wheel events — wheel opens the split instead
+    - Capped at _LIVE_MAX_LINES
+    - Wheel events open the split instead of scrolling
 
   _ScrollbackPane (top, hidden until split is active)
     - Full vertical scrollbar, user can browse freely
     - Shows a "tail" of history immediately when opened (synchronous)
-    - Older history is prepended lazily via a zero-interval QTimer so the
-      event loop stays live and the UI never freezes
+    - Older history is prepended lazily via a zero-interval QTimer
     - Scrolling to the bottom closes the split
 
-Public API (same as old single-pane widget):
-    append_ansi_line(text, newline=True)   — MUD line with ANSI codes
-    append_ansi_text(text)                 — #showme / arbitrary ANSI
-    append_local(text, color, brackets)    — italic client status message
-    feed_raw(data: bytes)                  — raw bytes (ANSI handled internally)
-    clear_output()
-    scroll_to_bottom()  / open_split() / close_split() / toggle_split()
-    font_size  property (int)
+Key fixes vs the old single-document version
+--------------------------------------------
+FIX A  prepend_spans: iterate reversed(spans), re-seek to Start each time so
+       oldest span ends up at the top and chronological order is preserved.
 
-Wheel / keyboard
-    _WheelRedirectFilter installed in main_window routes all wheel events here.
-    Ctrl+Return (menu action "Toggle scrollback split") calls toggle_split().
-    PageUp / PageDown on the widget also work.
+FIX B  _live_queue: spans that arrive *while the split is open* are buffered
+       here instead of being written into the visible scrollback QTextEdit.
+       Appending to a large visible document triggers repaints on every MUD
+       line and makes typing feel laggy.  The queue is flushed (with updates
+       blocked) when close_split() is called, or incrementally when the user
+       scrolls back to the bottom (_on_sb_value_changed).
+
+FIX C  _on_sb_value_changed: connected to the scrollback scrollbar in
+       open_split(), disconnected in close_split().  Flushes _live_queue
+       when near the bottom so content is current before the split closes.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ from PyQt6.QtGui     import (
     QPalette, QWheelEvent,
 )
 
-from core.ansi_parser import AnsiParser, AnsiSpan, TextStyle, _get_c16
+from core.ansi_parser import AnsiParser, AnsiSpan, TextStyle
 
 
 _LIVE_MAX_LINES    = 500
@@ -51,10 +50,17 @@ _SCROLLBACK_MAX    = 10_000
 _BG                = QColor(10, 10, 10)
 _FG                = QColor(200, 200, 200)
 
-def _ansi_bright(idx: int) -> QColor:
-    """Return the bright variant (index 8-15) of a standard colour from the
-    active palette. Reads _PALETTE live so theme changes take effect."""
-    return QColor(*_get_c16()[idx + 8])
+# Bright variants of the 8 standard ANSI colours (indices 8-15)
+_ANSI_BRIGHT = [
+    QColor( 85,  85,  85),  # bright black  (dark grey)
+    QColor(255,  85,  85),  # bright red
+    QColor( 85, 255,  85),  # bright green
+    QColor(255, 255,  85),  # bright yellow
+    QColor( 85,  85, 255),  # bright blue
+    QColor(255,  85, 255),  # bright magenta
+    QColor( 85, 255, 255),  # bright cyan
+    QColor(255, 255, 255),  # bright white
+]
 
 
 def _make_fmt(style: TextStyle, font: QFont) -> QTextCharFormat:
@@ -64,7 +70,7 @@ def _make_fmt(style: TextStyle, font: QFont) -> QTextCharFormat:
 
     # Bold-as-bright: bold + standard colour → bright variant
     if style.bold and style._fg_base_idx >= 0:
-        fg = _ansi_bright(style._fg_base_idx)
+        fg = _ANSI_BRIGHT[style._fg_base_idx]
     elif fg:
         fg = QColor(*fg)
     else:
@@ -84,20 +90,10 @@ def _make_fmt(style: TextStyle, font: QFont) -> QTextCharFormat:
     return fmt
 
 
-def _local_spans(text: str, color: str, brackets: bool, font: QFont) -> list:
-    """Produce a single AnsiSpan for a local (italic, coloured) message."""
-    line = ('[' + text + ']' if brackets else text) + '\n'
-    style = TextStyle()
-    style.italic = True
-    # Convert hex color to (r,g,b)
-    c = QColor(color)
-    style.fg = (c.red(), c.green(), c.blue())
-    return [AnsiSpan(line, style)]
-
-
 # ── Pane base ─────────────────────────────────────────────────────────────────
 
 class _Pane(QTextEdit):
+    """Base read-only pane with ANSI append/prepend support."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,9 +135,9 @@ class _Pane(QTextEdit):
     def prepend_spans(self, spans: list):
         """Insert spans at the very beginning of the document.
 
-        Each span is inserted at position 0, so we must iterate in REVERSE
-        order (newest-first) so that after all insertions the oldest span sits
-        at the top of the document and chronological order is preserved.
+        FIX A: iterate in REVERSE order, seeking to Start before each insert.
+        This way the oldest span (first in the list) ends up at the top of the
+        document and chronological order is fully preserved.
         """
         c = QTextCursor(self.document())
         for span in reversed(spans):
@@ -172,21 +168,20 @@ class _Pane(QTextEdit):
 # ── Live pane ─────────────────────────────────────────────────────────────────
 
 class _LivePane(_Pane):
-    """Always pinned to bottom, no scrollbar."""
+    """Always pinned to bottom, no scrollbar ever."""
 
     def __init__(self, output_widget: "OutputWidget", parent=None):
         super().__init__(parent)
         self._ow = output_widget
 
     def wheelEvent(self, event: QWheelEvent):
-        # Route wheel to OutputWidget instead of scrolling
         self._ow._on_wheel(event.angleDelta().y())
 
 
 # ── Scrollback pane ───────────────────────────────────────────────────────────
 
 class _ScrollbackPane(_Pane):
-    """Freely scrollable history pane. Scrolling to bottom closes the split."""
+    """Freely scrollable history pane. Visible only when split is active."""
 
     def __init__(self, output_widget: "OutputWidget", parent=None):
         super().__init__(parent)
@@ -194,7 +189,7 @@ class _ScrollbackPane(_Pane):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     def wheelEvent(self, event: QWheelEvent):
-        # Handled by _WheelRedirectFilter in main_window; fallback:
+        # Handled by _WheelRedirectFilter in main_window; this is the fallback.
         self._ow._on_wheel(event.angleDelta().y())
 
 
@@ -204,14 +199,21 @@ class OutputWidget(QWidget):
     """
     Split-scrollback output widget.
 
-    Lazy-load strategy (identical to reference implementation):
+    Lazy-load strategy:
       While split is closed, all incoming spans accumulate in _pending_spans.
       On open_split():
-        1. Synchronously write the last _TAIL_LINES lines (tail) to the
-           scrollback pane and pin to bottom — user sees recent content instantly.
+        1. Synchronously write the last _TAIL_LINES lines to the scrollback
+           pane and pin to bottom — user sees recent content instantly.
         2. A zero-interval QTimer prepends the older history in _FLUSH_CHUNK
            batches, end-to-start, so chronological order is maintained without
            blocking the event loop.
+
+    While split is open (FIX B — _live_queue):
+      New spans are buffered in _live_queue instead of being written to the
+      visible scrollback widget.  Writing to a large visible QTextEdit on
+      every MUD line causes repaints/cursor ops that make input feel laggy.
+      The queue is flushed when the user scrolls to the bottom
+      (_on_sb_value_changed) or when close_split() is called.
     """
 
     _TAIL_LINES       = 100
@@ -220,18 +222,15 @@ class OutputWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._parser        = AnsiParser()
-        self._line_parser   = AnsiParser()   # for line-by-line append_ansi_line
-        self._split_active  = False
-        self._flush_timer   = None
+        self._parser       = AnsiParser()
+        self._split_active = False
+        self._flush_timer  = None
         self._split_tail: list = []
 
         self._pending_spans: list = []
         self._pending_lines: int  = 0
 
-        # Spans that arrive while the split is open — buffered so we never
-        # touch the visible scrollback document mid-browse (causes lag).
-        # Flushed to scrollback on close or when user scrolls to the bottom.
+        # FIX B: buffer spans that arrive while the split is open
         self._live_queue: list = []
 
         layout = QVBoxLayout(self)
@@ -255,29 +254,10 @@ class OutputWidget(QWidget):
 
         layout.addWidget(self._splitter)
 
-    # ── Public ingest API ─────────────────────────────────────────────────
+    # ── Public ingest API ─────────────────────────────────────────────
 
     def feed_raw(self, data: bytes):
-        """Parse raw bytes and ingest resulting spans."""
         spans = self._parser.feed(data)
-        self.ingest(spans)
-
-    def append_ansi_line(self, text: str, newline: bool = True):
-        """Render one ANSI-coloured MUD line (with optional trailing newline)."""
-        payload = text + ('\n' if newline else '')
-        spans   = self._line_parser.feed(payload.encode('utf-8', errors='replace'))
-        self.ingest(spans)
-
-    def append_ansi_text(self, text: str):
-        """Render an arbitrary ANSI string (#showme). Resets parser state after."""
-        spans = self._line_parser.feed((text + '\n').encode('utf-8', errors='replace'))
-        # Reset so showme colors don't bleed into subsequent MUD output
-        self._line_parser = AnsiParser()
-        self.ingest(spans)
-
-    def append_local(self, text: str, color: str = '#5599ff', brackets: bool = True):
-        """Inject a local (italic, coloured) client message."""
-        spans = _local_spans(text, color, brackets, self._live.base_font)
         self.ingest(spans)
 
     def ingest(self, spans: list):
@@ -291,10 +271,8 @@ class OutputWidget(QWidget):
 
         # Scrollback handling
         if self._split_active:
-            # Don't write to the scrollback widget while the user is browsing —
-            # appending to a large visible QTextEdit causes repaints and cursor
-            # ops that make typing and MUD output feel laggy.
-            # Buffer here; flushed when the split closes or reaches bottom.
+            # FIX B: never touch the visible scrollback document while the
+            # user is browsing — buffer instead and flush later.
             self._live_queue.extend(spans)
         else:
             self._pending_spans.extend(spans)
@@ -311,7 +289,7 @@ class OutputWidget(QWidget):
             self._pending_lines -= dropped.text.count('\n')
         self._pending_lines = max(0, self._pending_lines)
 
-    # ── Tail split ────────────────────────────────────────────────────────
+    # ── Tail split ────────────────────────────────────────────────────
 
     def _split_off_tail(self):
         lines = 0
@@ -321,7 +299,7 @@ class OutputWidget(QWidget):
                 return self._pending_spans[:i], self._pending_spans[i:]
         return [], list(self._pending_spans)
 
-    # ── Async prepend flush ───────────────────────────────────────────────
+    # ── Async prepend flush ───────────────────────────────────────────
 
     def _start_prepend_flush(self):
         if self._flush_timer is not None:
@@ -371,13 +349,15 @@ class OutputWidget(QWidget):
                 self._pending_lines += span.text.count('\n')
             self._split_tail = []
 
-    # ── Split control ─────────────────────────────────────────────────────
+    # ── Split control ─────────────────────────────────────────────────
 
     def open_split(self):
         if self._split_active:
             return
         self._split_active = True
         self._scrollback.setVisible(True)
+
+        # FIX C: connect scrollbar so we can flush live_queue at bottom
         self._scrollback.verticalScrollBar().valueChanged.connect(
             self._on_sb_value_changed)
 
@@ -401,20 +381,22 @@ class OutputWidget(QWidget):
         if not self._split_active:
             return
         self._stop_flush()
+
+        # FIX C: disconnect scrollbar signal
         try:
             self._scrollback.verticalScrollBar().valueChanged.disconnect(
                 self._on_sb_value_changed)
         except Exception:
             pass
-        # Flush any spans that arrived while the user was browsing.
-        # Block signals/updates so the document write is invisible (pane is
-        # about to be hidden anyway) and then trim in one pass.
+
+        # FIX B: flush buffered live spans invisibly before hiding the pane
         if self._live_queue:
             self._scrollback.setUpdatesEnabled(False)
             self._scrollback.append_spans(self._live_queue)
             self._live_queue = []
             self._scrollback.trim_to(_SCROLLBACK_MAX)
             self._scrollback.setUpdatesEnabled(True)
+
         self._split_active = False
         self._scrollback.setVisible(False)
         self._live.pin_to_bottom()
@@ -425,11 +407,11 @@ class OutputWidget(QWidget):
         else:
             self.open_split()
 
-    # Alias used by old View→"Scroll to Bottom" menu action
+    # Alias used by old View → "Scroll to Bottom" menu action
     def scroll_to_bottom(self):
         self.close_split()
 
-    def clear_output(self):
+    def clear(self):
         self._stop_flush()
         self._split_active = False
         self._scrollback.setVisible(False)
@@ -440,11 +422,9 @@ class OutputWidget(QWidget):
         self._pending_spans.clear()
         self._pending_lines = 0
         self._live_queue = []
-        # Reset both parsers so color state is clean
-        self._parser      = AnsiParser()
-        self._line_parser = AnsiParser()
+        self._parser = AnsiParser()
 
-    # ── Font ──────────────────────────────────────────────────────────────
+    # ── Font ──────────────────────────────────────────────────────────
 
     @property
     def font_size(self) -> int:
@@ -455,20 +435,11 @@ class OutputWidget(QWidget):
         self._live.set_font_size(pt)
         self._scrollback.set_font_size(pt)
 
-    def font_larger(self):
-        if self.font_size < 24:
-            self.font_size = self.font_size + 1
-
-    def font_smaller(self):
-        if self.font_size > 7:
-            self.font_size = self.font_size - 1
-
-    # ── Internal ──────────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────
 
     def _flush_live_queue(self):
-        """Append any buffered live spans to the scrollback document.
-        Called when the user reaches the bottom so content is up-to-date
-        before close_split fires.  Safe to call multiple times."""
+        """Append buffered live spans to the scrollback document.
+        Safe to call multiple times; no-op if queue is empty."""
         if not self._live_queue:
             return
         self._scrollback.append_spans(self._live_queue)
@@ -476,14 +447,13 @@ class OutputWidget(QWidget):
         self._scrollback.trim_to(_SCROLLBACK_MAX)
 
     def _on_sb_value_changed(self, value: int):
-        """Flush live queue when scrollbar reaches the bottom."""
+        """FIX C: flush live queue when scrollbar is near the bottom."""
         sb = self._scrollback.verticalScrollBar()
         if value >= sb.maximum() - 5:
             self._flush_live_queue()
 
-
     def _on_wheel(self, delta_y: int):
-        """Called by _WheelRedirectFilter (and _LivePane fallback)."""
+        """Fallback handler (when _WheelRedirectFilter is not installed)."""
         if not self._split_active:
             if delta_y > 0:
                 self.open_split()
